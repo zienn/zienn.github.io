@@ -1,0 +1,485 @@
+---
+title: Android ANR 原理深度解析：埋炸弹、拆炸弹与引爆
+date: 2026-10-09
+tags: Android, Framework, 性能优化, 稳定性
+category: Android
+summary: 从 system_server 源码视角讲透 ANR：超时阈值（对照 AOSP main 核实）、appNotResponding 流程、traces 分析与 SIGQUIT 线上监控。
+---
+<!-- ============ 1 ============ -->
+<section id="what">
+<h2>1. 什么是 ANR</h2>
+<p><strong>ANR（Application Not Responding，应用无响应）</strong>是系统对“应用在规定时间内没有完成某项关键任务”的判定。注意几个关键点：</p>
+<ul>
+  <li><strong>裁判是系统，不是应用</strong>：ANR 由 <code>system_server</code> 进程里的 AMS（ActivityManagerService）、ActiveServices、BroadcastQueue 以及 native 层的 InputDispatcher 判定。</li>
+  <li><strong>只有“系统派发给应用的任务”才会触发</strong>：输入事件、广播、Service 生命周期等。你自己在主线程 <code>Thread.sleep(10000)</code>，如果期间没有任何系统任务派发过来，<em>不会</em>产生 ANR，只是卡。</li>
+  <li><strong>主线程不一定是罪魁祸首</strong>：主线程可能在等锁、等 Binder、等 IO，或者整机 CPU / 内存压力大导致进程根本没被调度到。</li>
+</ul>
+<div class="callout">
+  <strong>💡 一句话理解</strong>
+  系统给应用派活时先“埋一颗定时炸弹”（发一条延迟消息），应用按时干完就“拆弹”（移除消息），超时没拆，炸弹“引爆”——进入 <code>appNotResponding</code> 流程：抓 trace、写日志、弹窗或静默杀进程。
+</div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="bomb">
+<h2>2. 核心机制：埋炸弹 / 拆炸弹 / 引爆</h2>
+<p>除 Input 外，四类组件的 ANR 都遵循同一个模型：</p>
+
+<pre class="mermaid">
+flowchart TD
+    A["system_server 派发任务<br/>(bind/start service, 广播, 发布 provider)"] --> B["💣 埋炸弹<br/>sendMessageDelayed(TIMEOUT_MSG, T)<br/>或 AnrTimer.start()"]
+    B --> C["Binder 调用到 App 进程<br/>ApplicationThread.scheduleXxx"]
+    C --> D{"App 主线程<br/>在 T 内完成?"}
+    D -- 是 --> E["App 回调 AMS<br/>serviceDoneExecuting / finishReceiver / publishContentProviders"]
+    E --> F["✂️ 拆炸弹<br/>removeMessages(TIMEOUT_MSG)<br/>或 AnrTimer.cancel()"]
+    D -- 否 --> G["💥 引爆<br/>TIMEOUT_MSG 被处理"]
+    G --> H["appNotResponding()<br/>dump traces / 弹窗 / 杀进程"]
+</pre>
+
+<h3 id="timeouts">2.1 超时阈值总表（以 AOSP main 分支为准）</h3>
+<p>下表常量均已对照 AOSP <code>main</code> 分支源码核实。所有值都会乘以 <code>Build.HW_TIMEOUT_MULTIPLIER</code>（真机通常为 1，模拟器/慢速设备可能更大）。</p>
+<table>
+<thead><tr><th>类型</th><th>阈值</th><th>源码常量</th><th>判定方</th><th>超时后果</th></tr></thead>
+<tbody>
+<tr><td>输入事件（按键/触摸）</td><td><strong>5s</strong></td><td><code>IInputConstants.UNMULTIPLIED_DEFAULT_DISPATCHING_TIMEOUT_MILLIS = 5000</code></td><td>InputDispatcher (native)</td><td>ANR</td></tr>
+<tr><td>前台广播</td><td><strong>10s</strong></td><td><code>AMS.BROADCAST_FG_TIMEOUT</code> / <code>BroadcastConstants.DEFAULT_TIMEOUT</code></td><td>BroadcastQueue</td><td>ANR</td></tr>
+<tr><td>后台广播</td><td><strong>60s</strong></td><td><code>AMS.BROADCAST_BG_TIMEOUT</code></td><td>BroadcastQueue</td><td>ANR（通常静默）</td></tr>
+<tr><td>前台 Service</td><td><strong>20s</strong></td><td><code>ActivityManagerConstants.DEFAULT_SERVICE_TIMEOUT</code></td><td>ActiveServices</td><td>ANR</td></tr>
+<tr><td>后台 Service</td><td><strong>200s</strong></td><td><code>DEFAULT_SERVICE_BACKGROUND_TIMEOUT = SERVICE_TIMEOUT * 10</code></td><td>ActiveServices</td><td>ANR（通常静默）</td></tr>
+<tr><td><code>startForegroundService()</code> 后未调 <code>startForeground()</code></td><td><strong>30s</strong>（main；早期版本为 10s）</td><td><code>DEFAULT_SERVICE_START_FOREGROUND_TIMEOUT_MS = 30 * 1000</code></td><td>ActiveServices</td><td>ANR + Android 12+ 抛 <code>ForegroundServiceDidNotStartInTimeException</code></td></tr>
+<tr><td>shortService 类型前台服务（Android 14+）</td><td><strong>3min</strong>（+10s 宽限）</td><td><code>DEFAULT_SHORT_FGS_TIMEOUT_DURATION</code> / <code>..._ANR_EXTRA_WAIT_DURATION</code></td><td>ActiveServices</td><td>先回调 <code>Service.onTimeout()</code>，仍不停止则 ANR</td></tr>
+<tr><td>ContentProvider 发布</td><td><strong>10s</strong></td><td><code>ContentResolver.CONTENT_PROVIDER_PUBLISH_TIMEOUT_MILLIS</code></td><td>AMS / ContentProviderHelper</td><td><span class="badge">注意</span> <strong>直接杀进程</strong>，不是 ANR 弹窗</td></tr>
+</tbody>
+</table>
+<div class="callout warn">
+  <strong>⚠️ 容易被写错的点</strong>
+  很多文章说“ContentProvider 超时 10s 会 ANR”，但源码里 <code>processContentProviderPublishTimedOutLocked()</code> 做的是
+  <code>removeProcessLocked(..., REASON_INITIALIZATION_FAILURE, "timeout publishing content providers")</code>——<strong>直接移除进程</strong>。
+  真正走 ANR 的是客户端通过 <code>ContentProviderClient</code> 设置了 <code>setDetectNotResponding()</code> 后的 <code>appNotRespondingViaProvider</code>。
+</div>
+
+<h3 id="service">2.2 Service 超时（ActiveServices）</h3>
+<p>以 <code>startService</code> 为例：AMS 在通知 App 执行 <code>onCreate</code>/<code>onStartCommand</code> 前调用 <code>bumpServiceExecutingLocked()</code> → <code>scheduleServiceTimeoutLocked()</code> 埋雷；App 主线程执行完生命周期后通过 <code>serviceDoneExecuting()</code> 回调 AMS 拆雷。</p>
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Client as 调用方 App
+    participant AS as ActiveServices (system_server)
+    participant H as AMS Handler / AnrTimer
+    participant App as 目标 App 主线程
+    Client->>AS: startService(intent)
+    AS->>AS: realStartServiceLocked()
+    AS->>H: 💣 scheduleServiceTimeoutLocked()<br/>前台 20s / 后台 200s
+    AS->>App: scheduleCreateService() (Binder oneway)
+    App->>App: Service.onCreate()
+    App->>AS: serviceDoneExecuting()
+    AS->>H: ✂️ 取消 SERVICE_TIMEOUT
+    Note over H: 若超时未取消 → serviceTimeout()<br/>→ mAnrHelper.appNotResponding()
+</pre>
+<pre><code class="language-java">// ActiveServices.java（简化，Android 14 之前的经典写法）
+void scheduleServiceTimeoutLocked(ProcessRecord proc) {
+    if (proc.mServices.numberOfExecutingServices() == 0 || proc.getThread() == null) {
+        return;
+    }
+    Message msg = mAm.mHandler.obtainMessage(ActivityManagerService.SERVICE_TIMEOUT_MSG);
+    msg.obj = proc;
+    // 💣 埋雷：前台 20s，后台 200s
+    mAm.mHandler.sendMessageDelayed(msg, proc.mServices.shouldExecServicesFg()
+            ? mAm.mConstants.SERVICE_TIMEOUT
+            : mAm.mConstants.SERVICE_BACKGROUND_TIMEOUT);
+}
+
+private void serviceDoneExecutingLocked(ServiceRecord r, boolean inDestroying, ...) {
+    ...
+    if (r.app.mServices.numberOfExecutingServices() == 0) {
+        // ✂️ 拆雷
+        mAm.mHandler.removeMessages(ActivityManagerService.SERVICE_TIMEOUT_MSG, r.app);
+    }
+}
+</code></pre>
+<div class="callout"><strong>Android 15+：AnrTimer</strong>新版本中这些 <code>sendMessageDelayed/removeMessages</code> 被统一封装进 <code>com.android.server.utils.AnrTimer</code>（<code>mActiveServiceAnrTimer.start()/cancel()</code>），并可选地由 native 定时服务实现，还能在超时时对进程做“冻结 + 先抓 trace”。但“埋 / 拆 / 爆”的模型完全不变。</div>
+
+<h3 id="broadcast">2.3 Broadcast 超时（BroadcastQueue）</h3>
+<p>经典实现（Android 13 及以前 <code>BroadcastQueue.java</code>）只对<strong>有序广播</strong>和<strong>静态注册接收者</strong>（它们本质上是串行派发的）计时：派发给某个接收者前 <code>setBroadcastTimeoutLocked()</code>，接收者 <code>onReceive</code> 返回后（或 <code>goAsync()</code> 的 <code>PendingResult.finish()</code>）调用 <code>AMS.finishReceiver()</code> 拆雷。</p>
+<p>Android 14 引入 <code>BroadcastQueueModernImpl</code>（按进程分队列），目前 main 分支已删除旧的 <code>BroadcastQueueImpl</code>。现代队列有两个值得注意的细节（已对照源码核实）：</p>
+<pre><code class="language-java">// BroadcastRecord.java —— 哪些投递“视为已送达”，根本不计 ANR 时
+boolean isAssumedDelivered(int index) {
+    return (receivers.get(index) instanceof BroadcastFilter) // 动态注册的接收者
+            &amp;&amp; !ordered                                       // 非有序广播
+            &amp;&amp; (resultTo == null);                            // 不需要回传结果
+}
+
+// BroadcastQueueModernImpl.java —— “软超时”：先按 CPU 排队时间延长一次再引爆
+private void deliveryTimeoutSoftLocked(BroadcastProcessQueue queue, int softTimeoutMillis) {
+    if (queue.app != null) {
+        // 进程处于 runnable 但没拿到 CPU 的时间不算 App 的错，最多延长一次
+        final long cpuDelayTime = queue.app.getCpuDelayTime() - queue.lastCpuDelayTime;
+        final long hardTimeoutMillis = MathUtils.constrain(cpuDelayTime, 0, softTimeoutMillis);
+        mAnrTimer.start(queue, hardTimeoutMillis);
+    } else {
+        deliveryTimeoutLocked(queue);
+    }
+}
+</code></pre>
+<div class="callout ok"><strong>✅ 实践启示</strong>普通的 <code>context.registerReceiver()</code> + <code>sendBroadcast()</code> 在 Android 14+ 上不会因为 <code>onReceive</code> 慢而触发广播 ANR（但阻塞主线程依然可能导致 Input ANR）。静态接收者、有序广播依旧受 10s / 60s 约束。</div>
+
+<h3 id="provider">2.4 ContentProvider 超时</h3>
+<p>进程启动时 <code>attachApplicationLocked()</code> 中若该进程有待发布的 Provider，AMS 会发送 <code>CONTENT_PROVIDER_PUBLISH_TIMEOUT_MSG</code>（10s）；App 在 <code>handleBindApplication → installContentProviders → publishContentProviders</code> 后由 AMS 移除该消息。超时则<strong>杀进程</strong>。这也是为什么在 <code>ContentProvider.onCreate()</code> 里做重活（很多 SDK 借 Provider 自动初始化）会拖慢冷启动甚至导致进程被杀。</p>
+
+<h3 id="input">2.5 Input 超时（InputDispatcher）</h3>
+<p>Input ANR 不走 AMS Handler，而是在 native 层 <code>InputDispatcher</code> 里判定。Android 11 重构后（<code>AnrTracker</code>）逻辑为：事件发送到窗口的 InputChannel 后进入该连接的 <code>waitQueue</code>，并记录超时时间点；App 处理完通过 <code>finishInputEvent</code> 回传 <em>finished</em> 信号后从 waitQueue 移除。</p>
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant IR as InputReader
+    participant ID as InputDispatcher
+    participant App as App UI 线程 (Looper)
+    participant IMS as InputManagerService / AMS
+    IR->>ID: 新事件入 mInboundQueue
+    ID->>App: publishMotionEvent (socket)<br/>事件入 waitQueue，AnrTracker 记录 now+5s
+    alt 主线程空闲
+        App->>App: ViewRootImpl 分发 onTouchEvent
+        App->>ID: finishInputEvent → 移出 waitQueue ✂️
+    else 主线程阻塞 &gt; 5s
+        ID->>ID: processAnrsLocked() 发现超时 💥
+        ID->>IMS: notifyWindowUnresponsive / onAnr
+        IMS->>IMS: AMS.inputDispatchingTimedOut()<br/>→ AnrHelper.appNotResponding()
+    end
+</pre>
+<div class="callout warn"><strong>⚠️ 两个常见误解</strong>
+1）<strong>不是“主线程卡 5 秒就 ANR”</strong>：必须有输入事件在等待。用户不碰屏幕，卡 10s 也不会产生 Input ANR。<br>
+2）<strong>没有焦点窗口也会 ANR</strong>：按键事件需要焦点窗口，如果 App 有焦点应用但迟迟没有焦点窗口（例如 Activity 启动太慢），5s 后报 <code>Application does not have a focused window</code>。</div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="versions">
+<h2>3. 版本差异速览</h2>
+<table>
+<thead><tr><th>版本</th><th>变化</th><th>对开发者的影响</th></tr></thead>
+<tbody>
+<tr><td>Android 8.0 (O)</td><td>引入 <code>startForegroundService()</code>，须在时限内调用 <code>startForeground()</code></td><td>否则 ANR / 崩溃</td></tr>
+<tr><td>Android 11 (R)</td><td>InputDispatcher 重构 ANR 逻辑（AnrTracker）；新增 <code>AnrHelper</code> 在独立线程异步处理 ANR；新增 <code>ApplicationExitInfo</code>（<code>REASON_ANR</code> + <code>getTraceInputStream()</code>）</td><td><strong>App 下次启动可以直接拿到上次 ANR 的 trace</strong>，无需 root</td></tr>
+<tr><td>Android 12 (S)</td><td>ANR 处理逻辑迁移到 <code>ProcessErrorStateRecord.appNotResponding()</code>；FGS 未按时 startForeground 抛 <code>ForegroundServiceDidNotStartInTimeException</code></td><td>崩溃栈可直接定位</td></tr>
+<tr><td>Android 14 (U)</td><td>引入 <code>BroadcastQueueModernImpl</code>：按进程排队、动态注册的无序广播不计时、软超时按 CPU 延迟延长一次；新增 <code>shortService</code> FGS 类型（3 分钟超时 → <code>onTimeout()</code> → ANR）；抽出 <code>StackTracesDumpHelper</code></td><td>广播 ANR 的触发面变小；cached 进程的广播可能被延迟投递</td></tr>
+<tr><td>Android 15 (V)</td><td>引入 <code>AnrTimer</code> 统一管理超时；<code>dataSync</code>/<code>mediaProcessing</code> FGS 有 6 小时/24h 运行上限，超时回调 <code>Service.onTimeout(int,int)</code>，不停止则抛异常</td><td>长时间 FGS 需要处理 <code>onTimeout</code></td></tr>
+<tr><td>AOSP main</td><td>旧版 <code>BroadcastQueueImpl</code> 已删除；<code>startForeground</code> 超时默认 30s</td><td>以现代队列行为为准</td></tr>
+</tbody>
+</table>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="anr-flow">
+<h2>4. 引爆之后：appNotResponding 流程</h2>
+<p>无论是哪种超时，最后都会汇聚到 <code>AnrHelper.appNotResponding()</code>，它把记录放到队列中，在专用线程执行 <code>ProcessErrorStateRecord.appNotResponding()</code>：</p>
+<pre class="mermaid">
+flowchart TD
+    A["各类超时<br/>Service / Broadcast / Input / Provider Client"] --> B["AnrHelper.appNotResponding()<br/>入队，异步线程处理"]
+    B --> C{"进程正在关机 / 已 crash /<br/>已在 ANR / 已被杀?"}
+    C -- 是 --> X["忽略，直接返回"]
+    C -- 否 --> D["记录 EventLog am_anr<br/>收集 firstPids / lastPids"]
+    D --> E{"isSilentAnr()?<br/>后台 ANR 且未开启“显示后台 ANR”"}
+    E -- 否 --> F["dump 目标进程 + 相关进程<br/>+ 关键 native 进程 + CPU 使用率"]
+    E -- 是 --> G["只 dump 目标进程"]
+    F --> H["StackTracesDumpHelper.dumpStackTraces()<br/>debuggerd → 向目标进程发 SIGQUIT"]
+    G --> H
+    H --> I["ART SignalCatcher 线程<br/>收到 SIGQUIT，打印所有线程栈"]
+    I --> J["写入 /data/anr/anr_yyyy-MM-dd-HH-mm-ss-SSS<br/>logcat 打印 ANR in ... Reason: ..."]
+    J --> K["DropBox 记录 data_app_anr / system_app_anr<br/>ApplicationExitInfo 记录"]
+    K --> L{"后台静默 ANR?"}
+    L -- 是 --> M["直接 kill 进程（不弹窗）"]
+    L -- 否 --> N["发送 SHOW_NOT_RESPONDING_UI_MSG<br/>弹出“应用无响应”对话框：等待 / 关闭应用"]
+</pre>
+<h3>4.1 SIGQUIT 与 Signal Catcher</h3>
+<p>ART 虚拟机启动时会在每个进程中创建一个名为 <code>Signal Catcher</code> 的线程，并把 <code>SIGQUIT (3)</code> 在其他线程中屏蔽。收到 SIGQUIT 后，它会挂起所有线程（SuspendAll）、遍历线程打印 Java + native 栈，再通过 tombstoned 管道写入 <code>/data/anr</code>。你也可以手动触发：</p>
+<pre><code class="language-bash"># 让某进程打印线程栈（需 debuggable 或 root）
+adb shell kill -3 &lt;pid&gt;
+# 或使用 debuggerd 获取 Java 栈
+adb shell debuggerd -j &lt;pid&gt;
+
+# 查看 ANR 文件（普通设备无权限直接读，推荐 bugreport）
+adb shell ls -l /data/anr/
+adb bugreport ./bugreport.zip      # 解压后在 FS/data/anr/ 下
+
+# logcat 中定位
+adb logcat -b events | grep am_anr
+adb logcat -s ActivityManager | grep -A 20 "ANR in"
+</code></pre>
+<div class="callout"><strong>小知识</strong>源码 <code>ProcessErrorStateRecord</code> 中有一个兜底：若 trace 文件生成失败（<code>tracesFile == null</code>），会直接 <code>Process.sendSignal(pid, Process.SIGNAL_QUIT)</code>，让栈至少打印到 logcat。</div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="causes">
+<h2>5. 常见原因</h2>
+<div class="grid2">
+  <div class="card"><h4>🧵 主线程耗时操作</h4>磁盘 IO（SharedPreferences <code>commit</code>、数据库）、网络、大 JSON 解析、Bitmap 解码、复杂布局 inflate。</div>
+  <div class="card"><h4>🔒 锁竞争 / 死锁</h4>主线程 <code>synchronized</code> 等待被子线程长期持有的锁；两把锁交叉持有导致死锁。</div>
+  <div class="card"><h4>📞 同步 Binder 调用</h4>主线程调用 <code>getContentResolver().query()</code>、<code>PackageManager</code>、<code>AccountManager</code> 等，对端（含 system_server）忙或卡住。</div>
+  <div class="card"><h4>📦 SharedPreferences apply</h4><code>apply()</code> 的写盘任务会在 <code>Activity.onStop</code>/<code>Service</code> 生命周期中被 <code>QueuedWork.waitToFinish()</code> 同步等待。</div>
+  <div class="card"><h4>📣 Receiver / Service 里做重活</h4><code>onReceive</code>、<code>onCreate</code>、<code>onStartCommand</code> 都运行在主线程。</div>
+  <div class="card"><h4>🐢 系统资源紧张</h4>整机 CPU 满载、内存不足导致频繁 GC / kswapd、IO wait 高（<code>iowait</code>），主线程虽然“没做什么”但抢不到 CPU。</div>
+  <div class="card"><h4>📨 消息队列堆积</h4>主线程 Handler 被大量消息淹没，单个消息不慢但累计很慢，或一个超长消息排在 Input 前面。</div>
+  <div class="card"><h4>🧩 第三方 SDK 初始化</h4>在 <code>Application.onCreate</code> / <code>ContentProvider.onCreate</code> 中同步初始化。</div>
+</div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="traces">
+<h2>6. traces 分析实战</h2>
+<h3>6.1 先看 logcat 的 ANR 摘要</h3>
+<pre><code class="language-plaintext">E ActivityManager: ANR in com.example.blog (com.example.blog/.MainActivity)
+E ActivityManager: PID: 12345
+E ActivityManager: Reason: Input dispatching timed out (a1b2c3 com.example.blog/com.example.blog.MainActivity (server) is not responding. Waited 5001ms for MotionEvent)
+E ActivityManager: Load: 6.12 / 5.80 / 5.02
+E ActivityManager: CPU usage from 0ms to 7214ms later:
+E ActivityManager:   98% 12345/com.example.blog: 92% user + 6% kernel
+E ActivityManager:   35% 1234/system_server: 20% user + 15% kernel
+E ActivityManager:   3.1% 0.2% iowait ...
+</code></pre>
+<p>关注：<strong>Reason</strong>（哪类 ANR）、<strong>Load</strong>（整机负载）、<strong>CPU usage</strong>（本进程是否高 CPU、<code>iowait</code> 是否高、是否被其他进程抢占）。</p>
+
+<h3>6.2 再看 traces 中的主线程</h3>
+<pre><code class="language-plaintext">----- pid 12345 at 2026-10-09 16:20:31.123+0800 -----
+Cmd line: com.example.blog
+
+"main" prio=5 tid=1 Blocked
+  | group="main" sCount=1 ucsCount=0 flags=1 obj=0x72a1c4f8 self=0xb4000078a1c3b000
+  | sysTid=12345 nice=-10 cgrp=top-app sched=0/0 handle=0x7a2c1e44f8
+  | state=S schedstat=( 1823456789 345678901 2345 ) utm=160 stm=22 core=4 HZ=100
+  at com.example.blog.data.CacheManager.get(CacheManager.java:42)
+  - waiting to lock &lt;0x0d3f2a10&gt; (a java.lang.Object) held by thread 23
+  at com.example.blog.ui.MainActivity.onItemClick(MainActivity.java:88)
+  at android.view.View.performClick(View.java:7659)
+  ...
+  at android.os.Looper.loop(Looper.java:317)
+  at android.app.ActivityThread.main(ActivityThread.java:8705)
+
+"DiskWorker-1" prio=5 tid=23 Native
+  | group="main" sCount=1 ucsCount=0 flags=1 obj=0x13c80ab0 self=0xb4000078a1d5e800
+  | sysTid=12399 nice=0 cgrp=top-app sched=0/0 handle=0x76f3b2acb0
+  | state=D schedstat=( 98765432 123456789 512 ) utm=5 stm=4 core=2 HZ=100
+  native: #00 pc 000a2b14  /apex/com.android.runtime/lib64/bionic/libc.so (fsync+4)
+  at java.io.FileDescriptor.sync(Native method)
+  at com.example.blog.data.CacheManager.flushToDisk(CacheManager.java:77)
+  - locked &lt;0x0d3f2a10&gt; (a java.lang.Object)
+  at com.example.blog.data.CacheManager$1.run(CacheManager.java:60)
+</code></pre>
+<p><strong>结论</strong>：主线程 <code>Blocked</code>，在等锁 <code>0x0d3f2a10</code>，该锁被 <code>tid=23</code> 持有，而 tid=23 正处于 <code>state=D</code>（不可中断睡眠，通常是 IO）在执行 <code>fsync</code>。根因：<strong>写盘时持锁，主线程读缓存时争用同一把锁</strong>。修复：缩小临界区，IO 移出锁外，或使用读写分离/无锁快照。</p>
+
+<h3>6.3 线程状态速查</h3>
+<table>
+<thead><tr><th>状态</th><th>含义</th><th>排查方向</th></tr></thead>
+<tbody>
+<tr><td><code>Runnable</code></td><td>正在执行或等 CPU</td><td>看栈顶是否耗时计算；结合 <code>schedstat</code> 第二项（等待调度时间）判断是否抢不到 CPU</td></tr>
+<tr><td><code>Blocked</code></td><td>等待 <code>synchronized</code> 监视器锁</td><td>找 <code>held by thread N</code>，追踪持锁线程</td></tr>
+<tr><td><code>Waiting</code> / <code>TimedWaiting</code></td><td><code>Object.wait()</code> / <code>LockSupport.park()</code> / <code>sleep</code></td><td>J.U.C 锁、<code>CountDownLatch</code>、<code>Future.get()</code></td></tr>
+<tr><td><code>Native</code></td><td>执行 native 代码</td><td>看 native 栈：<code>binder_ioctl</code>（Binder 同步调用）、<code>epoll_wait</code>（空闲）、<code>read/fsync</code>（IO）</td></tr>
+<tr><td><code>Suspended</code></td><td>被 GC / 调试器挂起</td><td>看 GC 日志、内存压力</td></tr>
+</tbody>
+</table>
+<div class="callout warn"><strong>⚠️ 注意“栈漂移”</strong>trace 是在超时<em>之后</em>才抓的，抓到的主线程栈可能是“压死骆驼的最后一根稻草”，甚至是 <code>nativePollOnce</code>（主线程已空闲）。这时需要结合<strong>超时前一段时间的消息调度历史</strong>来判断，这也是 Matrix、Raster 等方案记录“消息历史”的原因。</div>
+
+<h3>6.4 分析流程</h3>
+<pre class="mermaid">
+flowchart TD
+    S["拿到 ANR"] --> A["logcat: Reason 类型 / Load / CPU / iowait"]
+    A --> B{"整机负载高或 iowait 高?"}
+    B -- 是 --> B1["系统问题优先：<br/>内存压力、其他进程抢占、IO 慢"]
+    B -- 否 --> C["traces: 看 main 线程状态与栈"]
+    C --> D{"状态?"}
+    D -- Blocked/Waiting --> D1["找持锁线程，递归分析"]
+    D -- Native binder --> D2["查对端进程 binder 事务<br/>/sys/kernel/debug/binder 或 bugreport"]
+    D -- Runnable --> D3["主线程自身耗时：<br/>CPU 计算 / 大量消息"]
+    D -- nativePollOnce --> D4["栈漂移：<br/>查消息历史、Perfetto trace"]
+</pre>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="mitigate">
+<h2>7. 规避与优化</h2>
+<h3>7.1 开发期：StrictMode</h3>
+<pre><code class="language-kotlin">class App : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        if (BuildConfig.DEBUG) {
+            StrictMode.setThreadPolicy(
+                StrictMode.ThreadPolicy.Builder()
+                    .detectDiskReads()
+                    .detectDiskWrites()
+                    .detectNetwork()
+                    .detectCustomSlowCalls()   // 配合 StrictMode.noteSlowCall()
+                    .penaltyLog()
+                    .penaltyFlashScreen()
+                    .build()
+            )
+            StrictMode.setVmPolicy(
+                StrictMode.VmPolicy.Builder()
+                    .detectLeakedClosableObjects()
+                    .detectActivityLeaks()
+                    .penaltyLog()
+                    .build()
+            )
+        }
+    }
+}
+</code></pre>
+<h3>7.2 编码原则</h3>
+<ul>
+  <li>IO / 网络 / 数据库一律放到协程 <code>Dispatchers.IO</code> 或线程池；主线程只做 UI。</li>
+  <li><code>BroadcastReceiver</code> 中耗时工作使用 <code>goAsync()</code> + 后台线程（仍受超时约束），或交给 <code>WorkManager</code>。</li>
+  <li><code>startForegroundService()</code> 后尽快在 <code>onStartCommand</code> 中调用 <code>startForeground()</code>。</li>
+  <li>SharedPreferences 迁移到 DataStore / MMKV，避免 <code>QueuedWork</code> 阻塞。</li>
+  <li>主线程避免 <code>synchronized</code> 与后台线程共享粗粒度锁，避免主线程同步 Binder。</li>
+  <li>SDK 初始化懒加载 / 使用 App Startup 并异步化。</li>
+</ul>
+<pre><code class="language-kotlin">class SyncReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val pending = goAsync()                       // 延长生命周期，但仍受 10s/60s 约束
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                Repository.sync(intent)               // 耗时操作放到 IO 线程
+            } finally {
+                pending.finish()                      // ✂️ 一定要 finish，否则必 ANR
+            }
+        }
+    }
+}
+</code></pre>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="monitor">
+<h2>8. 线上监控方案</h2>
+<h3>8.1 方案对比</h3>
+<table>
+<thead><tr><th>方案</th><th>原理</th><th>优点</th><th>缺点</th></tr></thead>
+<tbody>
+<tr><td>Looper Printer 监控（BlockCanary 思路）</td><td><code>Looper.setMessageLogging()</code>，在 <code>&gt;&gt;&gt;&gt;&gt; Dispatching</code> / <code>&lt;&lt;&lt;&lt;&lt; Finished</code> 间计时</td><td>简单，能抓“卡顿”</td><td>只是卡顿≠ANR；字符串拼接有开销；抓栈时机滞后</td></tr>
+<tr><td>Watchdog 线程（ANR-WatchDog）</td><td>子线程定期向主线程 post 任务，超时未执行即判卡</td><td>零侵入</td><td>误报/漏报多，与系统判定不一致</td></tr>
+<tr><td>SIGQUIT 信号监听（Matrix / xCrash）</td><td>系统判 ANR 时会向进程发 SIGQUIT，App 自己也捕获它</td><td><strong>与系统判定时机一致</strong>，可拿到完整 trace</td><td>需 native hook；需二次确认是否真的是本进程 ANR</td></tr>
+<tr><td><code>ApplicationExitInfo</code>（Android 11+）</td><td>下次启动读取 <code>REASON_ANR</code> 及 trace</td><td>官方 API、准确</td><td>非实时，拿不到 ANR 前的上下文</td></tr>
+<tr><td>Google Play Console / Firebase</td><td>系统上报</td><td>无需接入</td><td>只覆盖 Play 渠道，信息有限</td></tr>
+</tbody>
+</table>
+
+<h3>8.2 Looper 监控示例</h3>
+<pre><code class="language-kotlin">object LooperMonitor {
+    private const val THRESHOLD_MS = 300L
+    private var startTime = 0L
+
+    fun install() {
+        Looper.getMainLooper().setMessageLogging { msg ->
+            if (msg.startsWith("&gt;&gt;&gt;&gt;&gt;")) {
+                startTime = SystemClock.uptimeMillis()
+                StackSampler.start()                       // 后台线程周期采样主线程栈
+            } else if (msg.startsWith("&lt;&lt;&lt;&lt;&lt;")) {
+                val cost = SystemClock.uptimeMillis() - startTime
+                StackSampler.stop()
+                if (cost &gt; THRESHOLD_MS) {
+                    Reporter.reportJank(cost, msg, StackSampler.dump())
+                }
+            }
+        }
+    }
+}
+// Android 10+ 也可通过反射/系统 API Looper.setObserver（@hide）获得更低开销的回调。
+</code></pre>
+
+<h3>8.3 SIGQUIT 检测原理（Matrix / xCrash）</h3>
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant SS as system_server (AMS)
+    participant DBG as debuggerd / tombstoned
+    participant K as Kernel
+    participant SH as App 自装的 SIGQUIT handler
+    participant SC as ART Signal Catcher
+    SS->>DBG: dumpStackTraces(pid)
+    DBG->>K: 向 App 进程发送 SIGQUIT
+    Note over SH: App 提前 pthread_sigmask 解除 SIGQUIT 屏蔽<br/>并 sigaction 注册 handler
+    K->>SH: 回调 handler（先于 Signal Catcher）
+    SH->>SH: 记录 ANR 疑似事件 + 主线程栈 / 消息历史
+    SH->>SH: 二次确认：轮询 ActivityManager.getProcessesInErrorState()<br/>或检查主线程 Message 的 when 是否严重滞后
+    SH->>SC: syscall(tgkill, pid, signalCatcherTid, SIGQUIT)<br/>把信号转发回 Signal Catcher
+    SC->>DBG: 正常输出 traces，系统流程不受影响
+</pre>
+<pre><code class="language-cpp">// 简化示意（参考 Matrix SignalAnrTracer / xCrash xc_trace）
+static struct sigaction sOldHandler;
+
+static void anrSignalHandler(int sig, siginfo_t *info, void *uc) {
+    // 1. 判断是否来自其他进程（system_server/debuggerd），排除自己 kill -3
+    if (info-&gt;si_pid != getpid()) {
+        onAnrDumpTriggered();          // 通知 Java 层：抓栈、二次确认、上报
+    }
+    // 2. 转发给 Signal Catcher，保证系统 trace 正常生成
+    syscall(SYS_tgkill, getpid(), findSignalCatcherTid(), SIGQUIT);
+}
+
+void installAnrMonitor() {
+    sigset_t set;
+    sigemptyset(&amp;set);
+    sigaddset(&amp;set, SIGQUIT);
+    pthread_sigmask(SIG_UNBLOCK, &amp;set, nullptr);   // ART 默认屏蔽了 SIGQUIT
+
+    struct sigaction sa{};
+    sa.sa_sigaction = anrSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    sigaction(SIGQUIT, &amp;sa, &amp;sOldHandler);
+}
+</code></pre>
+<div class="callout danger"><strong>❗ 为什么需要“二次确认”</strong>收到 SIGQUIT 不等于本进程 ANR：其他进程 ANR 时，系统也会 dump 相关进程（firstPids/lastPids）；手动 <code>kill -3</code> 也会触发。Matrix 的做法是检查 <code>ActivityManager.getProcessesInErrorState()</code> 中是否有本进程的 <code>NOT_RESPONDING</code> 记录，并结合主线程消息队列头部消息是否已严重超时。</div>
+
+<h3>8.4 Android 11+ 官方兜底：ApplicationExitInfo</h3>
+<pre><code class="language-kotlin">fun reportLastAnr(context: Context) {
+    if (Build.VERSION.SDK_INT &lt; Build.VERSION_CODES.R) return
+    val am = context.getSystemService(ActivityManager::class.java)
+    am.getHistoricalProcessExitReasons(context.packageName, 0, 5)
+        .filter { it.reason == ApplicationExitInfo.REASON_ANR }
+        .forEach { info -&gt;
+            val trace = info.traceInputStream?.bufferedReader()?.use { it.readText() }
+            Reporter.reportAnr(
+                timestamp = info.timestamp,
+                description = info.description,   // 例如 "Input dispatching timed out ..."
+                trace = trace
+            )
+        }
+}
+</code></pre>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="summary">
+<h2>9. 总结 &amp; Checklist</h2>
+<div class="grid2">
+  <div class="card"><h4>🧠 原理</h4>系统派活 → 埋雷 → App 完成回调拆雷 → 超时引爆 → <code>appNotResponding</code>。Input 由 native InputDispatcher 判定，其余由 AMS 侧判定。</div>
+  <div class="card"><h4>⏱️ 阈值</h4>Input 5s · 前台广播 10s · 后台广播 60s · 前台 Service 20s · 后台 Service 200s · Provider 发布 10s（杀进程）。</div>
+  <div class="card"><h4>🔍 分析</h4>Reason → Load/CPU/iowait → main 线程状态 → 锁/Binder/IO → 警惕栈漂移。</div>
+  <div class="card"><h4>🛡️ 治理</h4>StrictMode 开发期拦截；线上 SIGQUIT 实时监控 + ApplicationExitInfo 兜底 + 消息历史还原现场。</div>
+</div>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="refs">
+<h2>10. 参考资料</h2>
+<ol class="refs">
+  <li><a href="https://developer.android.com/topic/performance/vitals/anr" target="_blank" rel="noopener">Android Developers — ANRs</a></li>
+  <li><a href="https://source.android.com/docs/core/tests/debug/read-bug-reports" target="_blank" rel="noopener">AOSP — Read bug reports（ANR 与 traces 章节）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/ActivityManagerService.java" target="_blank" rel="noopener">ActivityManagerService.java（BROADCAST_FG/BG_TIMEOUT, CONTENT_PROVIDER_PUBLISH_TIMEOUT_MSG）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/ActivityManagerConstants.java" target="_blank" rel="noopener">ActivityManagerConstants.java（SERVICE_TIMEOUT, SERVICE_BACKGROUND_TIMEOUT, START_FOREGROUND, SHORT_FGS）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/ActiveServices.java" target="_blank" rel="noopener">ActiveServices.java</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/BroadcastQueueModernImpl.java" target="_blank" rel="noopener">BroadcastQueueModernImpl.java（Android 14+ 现代广播队列）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/BroadcastRecord.java" target="_blank" rel="noopener">BroadcastRecord.java（isAssumedDelivered）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/ContentProviderHelper.java" target="_blank" rel="noopener">ContentProviderHelper.java（processContentProviderPublishTimedOutLocked）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/content/ContentResolver.java" target="_blank" rel="noopener">ContentResolver.java（CONTENT_PROVIDER_PUBLISH_TIMEOUT_MILLIS）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/native/+/refs/heads/main/libs/input/android/os/IInputConstants.aidl" target="_blank" rel="noopener">IInputConstants.aidl（UNMULTIPLIED_DEFAULT_DISPATCHING_TIMEOUT_MILLIS = 5000）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/native/+/refs/heads/main/services/inputflinger/dispatcher/InputDispatcher.cpp" target="_blank" rel="noopener">InputDispatcher.cpp</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/ProcessErrorStateRecord.java" target="_blank" rel="noopener">ProcessErrorStateRecord.java（appNotResponding, isSilentAnr）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/am/StackTracesDumpHelper.java" target="_blank" rel="noopener">StackTracesDumpHelper.java（/data/anr, anr_ 前缀）</a></li>
+  <li><a href="https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/utils/AnrTimer.java" target="_blank" rel="noopener">AnrTimer.java（Android 15+）</a></li>
+  <li><a href="https://developer.android.com/reference/android/app/ApplicationExitInfo" target="_blank" rel="noopener">ApplicationExitInfo API</a></li>
+  <li><a href="https://developer.android.com/develop/background-work/services/fgs/timeout" target="_blank" rel="noopener">Foreground service timeouts（Android 15）</a></li>
+  <li><a href="https://github.com/Tencent/matrix" target="_blank" rel="noopener">Tencent/Matrix（SignalAnrTracer）</a></li>
+  <li><a href="https://github.com/iqiyi/xCrash" target="_blank" rel="noopener">iqiyi/xCrash</a></li>
+  <li><a href="https://github.com/SalomonBrys/ANR-WatchDog" target="_blank" rel="noopener">ANR-WatchDog</a> · <a href="https://github.com/markzhai/AndroidPerformanceMonitor" target="_blank" rel="noopener">BlockCanary</a></li>
+</ol>
+<p style="color:var(--muted);font-size:13px">源码常量于 2026-10-09 对照 AOSP <code>main</code> 分支核实；不同厂商 ROM 可能通过 DeviceConfig 调整这些值。</p>
+</section>

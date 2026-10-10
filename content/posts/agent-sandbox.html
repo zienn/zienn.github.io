@@ -1,0 +1,747 @@
+---
+title: AI Agent 沙箱全解：隔离层级、生命周期与“一个 Pod 跑多个沙箱”
+date: 2026-10-09
+tags: AI Agent, Sandbox, Kubernetes, 安全
+category: AI 基础设施
+summary: namespace/seccomp、容器、gVisor、Firecracker、Kata、WASM 隔离层级，沙箱生命周期，Agent Server 架构，单 Pod 多沙箱落地与主流项目对比。
+---
+<!-- ============ 1 ============ -->
+<section id="what">
+<h2>1. 什么是 Agent 沙箱，为什么需要</h2>
+<p><strong>Agent 沙箱</strong>是给 AI Agent 的“工具调用”（执行代码、shell 命令、浏览器、文件读写等）提供的<strong>受限执行环境</strong>。模型输出的代码本质上是<strong>不可信代码</strong>：它可能有 bug、可能被提示注入（prompt injection）操纵，也可能来自恶意用户。</p>
+<div class="grid2">
+  <div class="card"><h4>🧪 代码执行隔离</h4>防止 <code>rm -rf /</code>、fork 炸弹、提权、逃逸到宿主机或其他租户。</div>
+  <div class="card"><h4>📁 文件系统</h4>每个会话独立工作目录；宿主只读或不可见；凭据（<code>~/.ssh</code>、云 token）不可访问。</div>
+  <div class="card"><h4>🌐 网络</h4>默认拒绝出网，或只允许经代理访问白名单域名，防数据外泄和攻击内网（如云元数据 169.254.169.254）。</div>
+  <div class="card"><h4>📊 资源限制</h4>CPU、内存、PID 数、磁盘、运行时长都要有上限，避免一个会话拖垮整台机器。</div>
+</div>
+<div class="callout"><strong>💡 威胁模型决定选型</strong>
+“本地 CLI 帮自己改代码”和“SaaS 平台运行陌生人提交的代码”是完全不同的威胁模型。前者用 OS 原生沙箱（bubblewrap / Seatbelt）通常就够了；后者通常需要<strong>独立内核</strong>（gVisor 或 microVM）这一级的隔离。</div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="levels">
+<h2>2. 隔离层级</h2>
+<p>从弱到强（同时也大致从轻到重）：</p>
+<div class="stack">
+  <div>① <strong>进程级</strong>：namespace + seccomp + Landlock + rlimit/cgroup，共享宿主内核 —— bubblewrap、nsjail、srt、Codex</div>
+  <div>② <strong>容器</strong>：runc + 镜像 + cgroup + 默认 seccomp，共享宿主内核 —— Docker、Podman、Daytona 默认</div>
+  <div>③ <strong>用户态内核</strong>：在用户态重新实现 Linux 系统调用，宿主内核暴露面大幅缩小 —— gVisor（Modal 在用）</div>
+  <div>④ <strong>microVM</strong>：KVM 硬件虚拟化，每个沙箱有自己的 guest 内核 —— Firecracker、Kata、libkrun（E2B、microsandbox）</div>
+  <div>⊕ <strong>WASM</strong>：语言级 / 字节码级隔离，能力式（capability）权限，启动最快，但只能跑编译成 wasm 的代码 —— Wasmtime、WasmEdge</div>
+</div>
+
+<pre class="mermaid">
+flowchart TB
+    subgraph L1["① 进程 / ② 容器"]
+      A1["不可信代码"] -->|"系统调用（经 seccomp 过滤）"| K1["宿主 Linux 内核"]
+    end
+    subgraph L3["③ gVisor"]
+      A3["不可信代码"] -->|"系统调用被拦截"| S3["Sentry（用户态内核, Go）"]
+      S3 -->|"少量受限 syscall"| K3["宿主 Linux 内核"]
+    end
+    subgraph L4["④ microVM"]
+      A4["不可信代码"] --> G4["Guest 内核"]
+      G4 -->|"virtio / KVM 退出"| V4["VMM: Firecracker / Cloud Hypervisor / QEMU"]
+      V4 --> K4["宿主 Linux 内核 + KVM"]
+    end
+</pre>
+
+<h3 id="lv-process">2.1 进程级：namespace + seccomp</h3>
+<p>Linux 提供的积木：</p>
+<ul>
+  <li><strong>namespaces</strong>：<code>mnt</code>（独立挂载视图）、<code>pid</code>、<code>net</code>（空网络栈）、<code>user</code>（容器内 root ≠ 宿主 root）、<code>ipc</code>、<code>uts</code>、<code>cgroup</code>。</li>
+  <li><strong>seccomp-bpf</strong>：系统调用白/黑名单，例如禁止 <code>socket(AF_INET)</code>、<code>ptrace</code>、<code>mount</code>。</li>
+  <li><strong>Landlock</strong>：非特权进程也能给自己加文件系统访问规则。</li>
+  <li><strong>cgroup v2 / rlimit</strong>：CPU、内存、pids 上限。</li>
+  <li><strong>no_new_privs</strong>：禁止通过 setuid 程序提权。</li>
+</ul>
+<pre><code class="language-bash"># bubblewrap：只读宿主根目录，仅工作目录可写，断网，独立 PID 命名空间
+bwrap \
+  --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 --ro-bind /bin /bin \
+  --bind /srv/sessions/s-42/work /work --chdir /work \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --unshare-all --die-with-parent --new-session \
+  --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /work \
+  python3 -c 'print("hello from sandbox")'
+</code></pre>
+<p>OpenAI Codex CLI 和 Anthropic sandbox-runtime（srt）在 Linux 上都是这个思路：Codex 现在<strong>默认用 bubblewrap</strong> 构造文件系统视图，再在进程内加 <code>PR_SET_NO_NEW_PRIVS</code> 和 seccomp 网络过滤，Landlock 降为可选的旧方案；srt 用 bubblewrap 加网络命名空间，所有出网流量必须经过宿主上的代理（通过 Unix socket 桥接），由代理按域名白名单放行。</p>
+
+<h3 id="lv-container">2.2 容器</h3>
+<p>本质上是 2.1 的“打包版”：OCI 镜像 + runc + 默认 seccomp/AppArmor 配置 + cgroup。好处是生态成熟、镜像现成；问题是<strong>共享宿主内核</strong>，内核漏洞（如 Dirty Pipe、各类 io_uring 漏洞）可以导致逃逸。多租户运行陌生代码时，一般不把普通 runc 容器当作唯一的安全边界。</p>
+
+<h3 id="lv-gvisor">2.3 用户态内核：gVisor</h3>
+<p>gVisor 的 <code>runsc</code> 是一个 OCI 运行时。它的 <strong>Sentry</strong> 在用户态用 Go 实现了大部分 Linux 系统调用，网络栈（netstack）也在用户态；文件访问经 <strong>Gofer</strong>（或 directfs）代理。平台层可以选 <code>systrap</code>（默认，不需要 KVM）或 <code>kvm</code>。优点：启动接近容器，不需要嵌套虚拟化；代价：syscall 密集型和 IO 密集型负载有额外开销，少数系统调用不兼容。Modal Sandboxes 和 GKE Sandbox 都基于 gVisor。</p>
+
+<h3 id="lv-microvm">2.4 microVM：Firecracker / Kata / libkrun</h3>
+<ul>
+  <li><strong>Firecracker</strong>（AWS Lambda/Fargate 在用）：Rust 编写的极简 VMM，只提供 virtio-net/blk/vsock 等少量设备。官方规格：从 <code>InstanceStart</code> 到 guest <code>/sbin/init</code> 不超过 <strong>125ms</strong>（1 vCPU / 128MiB、最小内核），每个 VMM 进程的内存开销不超过 <strong>5MiB</strong>（不含 guest 内存）。支持<strong>快照/恢复</strong>，生产环境建议用 <code>jailer</code> 包一层（chroot + cgroup + namespace + 降权）。</li>
+  <li><strong>Kata Containers</strong>：把 microVM 包装成 OCI 运行时，可在 K8s 中通过 <code>RuntimeClass</code> 使用。底层可选 QEMU、Cloud Hypervisor、Firecracker、Dragonball。</li>
+  <li><strong>libkrun</strong>：把 VMM 做成一个库嵌进进程，microsandbox 基于它（Linux KVM / macOS HVF）。</li>
+</ul>
+
+<h3 id="lv-wasm">2.5 WebAssembly</h3>
+<p>Wasm 模块默认什么都不能做，文件、网络、时钟等能力都要通过 WASI 显式授予。Wasmtime 的 pooling allocator 实例化一个小模块约 <strong>5µs</strong>（官方基准 PR 实测 5.27–5.43µs）。缺点：Agent 常用的 <code>pip install</code>、任意二进制、完整 shell 都跑不了；适合插件、表达式求值、Python-in-Wasm（Pyodide）这类受限场景。</p>
+
+<table>
+<thead><tr><th>层级</th><th>隔离边界</th><th>典型启动</th><th>密度</th><th>兼容性</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>进程级</td><td>宿主内核 + seccomp</td><td>毫秒级</td><td>极高</td><td>完整 Linux 用户态</td><td>本地 CLI、单租户、可信度较高的 Agent</td></tr>
+<tr><td>容器</td><td>宿主内核</td><td>约百毫秒到 1 秒</td><td>高</td><td>完整</td><td>单租户、内部工具</td></tr>
+<tr><td>gVisor</td><td>用户态内核</td><td>约百毫秒到 1 秒</td><td>高</td><td>大部分 syscall</td><td>多租户代码执行（无 KVM 环境）</td></tr>
+<tr><td>microVM</td><td>硬件虚拟化</td><td>约 100ms 冷启动；快照恢复更快</td><td>中高</td><td>完整（独立内核）</td><td>多租户、强隔离、长会话</td></tr>
+<tr><td>WASM</td><td>运行时 + 能力模型</td><td>微秒级</td><td>极高</td><td>仅限 wasm</td><td>插件、函数级执行</td></tr>
+</tbody>
+</table>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="lifecycle">
+<h2>3. 沙箱生命周期：何时创建、何时销毁</h2>
+<h3>3.1 粒度：按会话 or 按任务</h3>
+<div class="grid2">
+  <div class="card"><h4>按会话（per-session）</h4>一次对话共用一个沙箱，文件、已装依赖、进程状态在多次工具调用之间保留。Code Interpreter、编码 Agent 常用这种。</div>
+  <div class="card"><h4>按任务 / 按调用（per-task）</h4>每次执行都用全新沙箱，跑完即毁。最安全、无状态残留，适合评测、RL rollout、一次性函数执行。</div>
+</div>
+<h3>3.2 关键策略</h3>
+<ul>
+  <li><strong>懒创建（lazy create）</strong>：会话开始时不建沙箱，第一次真正发生工具调用时才建。很多对话根本不跑代码，这样能省下大量资源。</li>
+  <li><strong>空闲 TTL</strong>：最后一次活动后 N 分钟没有动作就暂停或销毁；再设一个最长存活时间作为硬上限。</li>
+  <li><strong>会话结束</strong>：用户关闭会话或会话过期时主动销毁，并清理卷、网络、cgroup。</li>
+  <li><strong>预热池（warm pool）</strong>：预先启动 N 个空白沙箱，请求来了直接“认领”，把冷启动挪出关键路径。</li>
+  <li><strong>快照 / 恢复（snapshot/restore）</strong>：把“装好依赖的已启动环境”做成内存加磁盘快照，新沙箱直接从快照恢复。E2B 的“创建”本质上就是恢复一个预启动的快照：内存页通过 <code>userfaultfd</code> 按需加载，根文件系统是写时复制（CoW）。</li>
+  <li><strong>暂停 / 恢复（pause/resume）</strong>：空闲时把整个沙箱状态保存下来，释放 CPU 和内存，有流量时再透明唤醒。E2B、Daytona、k8s agent-sandbox（hibernation）都支持。</li>
+  <li><strong>Fork</strong>：从一个运行中的沙箱分叉出多个副本，适合并行探索、RL。</li>
+</ul>
+
+<h3>3.3 状态图</h3>
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> Pooled: 预热池补货
+    [*] --> Creating: 首次工具调用（懒创建，池为空）
+    Pooled --> Assigned: 会话认领 claim
+    Creating --> Assigned: 启动完成 / 快照恢复完成
+    Assigned --> Running: 执行工具调用
+    Running --> Idle: 调用返回
+    Idle --> Running: 新的工具调用
+    Idle --> Paused: 空闲超过 pause TTL（保存内存+磁盘快照）
+    Paused --> Running: 新请求 / 网络流量唤醒（resume）
+    Idle --> Terminating: 会话结束 / 空闲超过 kill TTL
+    Running --> Terminating: 超过最长存活 / 超出资源上限 / 被强杀
+    Paused --> Terminating: 快照保留期到期
+    Terminating --> [*]: 删除进程、cgroup、netns、工作目录、卷
+</pre>
+
+<h3>3.4 一次工具调用的时序</h3>
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant AS as Agent Server
+    participant LLM as 模型
+    participant SM as Sandbox Manager
+    participant SB as 沙箱
+    U->>AS: 发消息
+    AS->>LLM: prompt + 工具定义
+    LLM-->>AS: tool_call: run_python(code)
+    AS->>SM: get_or_create(session_id)
+    alt 已有沙箱（Idle / Paused）
+        SM->>SB: resume（如需要）
+    else 没有沙箱
+        SM->>SM: 从预热池认领，或冷启动 / 快照恢复
+    end
+    SM-->>AS: sandbox handle
+    AS->>SB: exec(code, timeout=60s)
+    SB-->>AS: stdout / stderr / exit code / 产物文件
+    AS->>SM: touch(session_id) 刷新 last_active
+    AS->>LLM: tool_result
+    LLM-->>AS: 最终回答
+    AS-->>U: 回复
+    Note over SM: 后台 GC：扫描超过 TTL 的会话，暂停或销毁
+</pre>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="arch">
+<h2>4. Agent Server 架构：多会话对应多沙箱</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph Clients
+      C1["Web / IDE / API"]
+    end
+    C1 --> GW["API 网关 / 负载均衡"]
+    GW --> AS1["Agent Server 副本 1<br/>(无状态：对话编排、调模型)"]
+    GW --> AS2["Agent Server 副本 N"]
+    AS1 --> SM["Sandbox Manager / Control Plane<br/>session→sandbox 映射、配额、TTL、GC"]
+    AS2 --> SM
+    SM --> REG[("Redis / Postgres<br/>会话与沙箱元数据")]
+    SM --> POOL["预热池控制器"]
+    SM --> N1["沙箱节点 1<br/>(Pod / 宿主机 + 节点 Agent)"]
+    SM --> N2["沙箱节点 2"]
+    N1 --> S11["sandbox s-1"]
+    N1 --> S12["sandbox s-2"]
+    N2 --> S21["sandbox s-3"]
+    S11 -. "出网" .-> EP["Egress 代理<br/>域名白名单 / 审计 / 凭据注入"]
+    S21 -. "出网" .-> EP
+    N1 --> OBJ[("对象存储：快照 / 产物")]
+</pre>
+<ul>
+  <li><strong>Agent Server 保持无状态</strong>：会话到沙箱的映射放在外部存储，任何副本都能处理任何会话。</li>
+  <li><strong>Sandbox Manager</strong> 负责调度（选节点、做亲和）、配额（每个用户/租户最多几个沙箱）、TTL 和 GC。</li>
+  <li><strong>节点 Agent</strong>（如 E2B 的 orchestrator 加 VM 内的 envd）负责在本机实际创建和执行沙箱，对外暴露 <code>exec / files / pty</code> 等 API。</li>
+  <li><strong>凭据不进沙箱</strong>：由 egress 代理在请求经过时注入 token（microsandbox、srt 都采用类似思路），沙箱里的代码拿不到真实密钥。</li>
+</ul>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="onepod">
+<h2>5. 一个 Kubernetes Pod 内运行多个沙箱</h2>
+<p>为什么要这样做？<strong>Pod 冷启动</strong>（调度、拉镜像、挂卷、CNI）通常要秒级，而且每个 Pod 都占用 API Server、etcd 和 kubelet 的资源。会话量一旦到了上万，一个会话一个 Pod 的成本和延迟都很难接受。做法是让一个“沙箱宿主 Pod”（大规格、长期运行）在内部按会话再起一层隔离。</p>
+
+<pre class="mermaid">
+flowchart TB
+    subgraph Node["K8s Node"]
+      subgraph Pod["sandbox-host Pod（长期运行, 大规格）"]
+        D["节点 Agent 进程<br/>HTTP/gRPC: create / exec / destroy"]
+        D --> SA["沙箱 s-1<br/>bwrap / runsc / Firecracker VM"]
+        D --> SB["沙箱 s-2"]
+        D --> SC["沙箱 s-3"]
+        SA --- WA["/sessions/s-1/work"]
+        SB --- WB["/sessions/s-2/work"]
+        SC --- WC["/sessions/s-3/work"]
+        CG["cgroup v2 子树<br/>/sys/fs/cgroup/sandboxes/s-*"]
+      end
+    end
+    SM["Sandbox Manager"] --> D
+</pre>
+
+<h3 id="op-bwrap">5.1 方案 A：每个会话一个 bubblewrap / nsjail 进程</h3>
+<p>最轻量的方案，毫秒级启动，单个 Pod 可承载数百个沙箱。隔离强度属于进程级，适合单租户或可信度较高的场景，也可以叠加在 gVisor Pod（<code>runtimeClassName: gvisor</code>）之上形成两层防护。</p>
+<div class="callout warn"><strong>⚠️ Pod 内创建 namespace 需要权限</strong>
+容器运行时默认的 seccomp/AppArmor 配置通常会拦截非特权的 <code>unshare(CLONE_NEWUSER)</code> 和 <code>mount</code>，被 mask 的 <code>/proc</code> 也会导致 <code>--proc</code> 失败。常见做法：
+① 开启 <strong>K8s 用户命名空间</strong>（<code>hostUsers: false</code>，v1.36 已 GA），再授予 <code>SYS_ADMIN</code>，这个能力只在 Pod 自己的 userns 内有效，比 privileged 安全得多；
+② 配合 <code>procMount: Unmasked</code>（需要 userns）和自定义 seccomp profile；
+③ 退而求其次用 <code>privileged: true</code>。不论哪种，都应该叠加 gVisor/Kata 运行时，或者让沙箱节点专用并打污点隔离。</div>
+
+<pre><code class="language-yaml"># sandbox-host Pod：用户命名空间 + 受限能力，用于在内部运行 bwrap/nsjail
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-host
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: sandbox-host } }
+  template:
+    metadata:
+      labels: { app: sandbox-host }
+    spec:
+      hostUsers: false                 # K8s user namespaces (GA in v1.36)
+      automountServiceAccountToken: false
+      # runtimeClassName: gvisor       # 可选：外层再套一层 gVisor
+      nodeSelector: { workload: sandbox }
+      tolerations: [{ key: sandbox, operator: Exists, effect: NoSchedule }]
+      containers:
+      - name: agentd
+        image: registry.example.com/sandbox-host:1.4   # 内置 bwrap / nsjail / python 等
+        ports: [{ containerPort: 8080 }]
+        resources:
+          requests: { cpu: "8", memory: 32Gi, ephemeral-storage: 100Gi }
+          limits:   { cpu: "16", memory: 64Gi, ephemeral-storage: 200Gi }
+        securityContext:
+          capabilities: { add: ["SYS_ADMIN"], drop: ["NET_RAW"] }
+          procMount: Unmasked
+          seccompProfile: { type: Localhost, localhostProfile: profiles/sandbox-host.json }
+          appArmorProfile: { type: Unconfined }
+        volumeMounts:
+        - { name: sessions, mountPath: /sessions }
+      volumes:
+      - name: sessions
+        emptyDir: { sizeLimit: 200Gi }
+</code></pre>
+
+<p>下面是节点 Agent 的核心逻辑（Python）：按会话创建工作目录和 cgroup，用 bwrap 执行命令，记录活跃时间，后台按 TTL 回收。</p>
+<pre><code class="language-python"># agentd/sandbox.py —— 单 Pod 多沙箱管理器（bubblewrap + cgroup v2）
+import asyncio, os, shutil, time, uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SESSIONS = Path("/sessions")
+CGROOT = Path("/sys/fs/cgroup/sandboxes")   # 需要 cgroup 可写（cgroupns + 委派）
+IDLE_TTL = 15 * 60          # 空闲 15 分钟回收
+MAX_LIFETIME = 4 * 3600     # 最长存活 4 小时
+MAX_SANDBOXES = 200         # 单 Pod 容量上限
+
+
+@dataclass
+class Sandbox:
+    id: str
+    session_id: str
+    workdir: Path
+    cgroup: Path
+    created: float = field(default_factory=time.time)
+    last_active: float = field(default_factory=time.time)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class SandboxManager:
+    def __init__(self) -&gt; None:
+        self.by_session: dict[str, Sandbox] = {}
+        CGROOT.mkdir(parents=True, exist_ok=True)
+        # 在父 cgroup 打开子控制器，子 cgroup 才能设置 cpu/memory/pids 限制
+        (CGROOT / "cgroup.subtree_control").write_text("+cpu +memory +pids")
+
+    async def get_or_create(self, session_id: str) -&gt; Sandbox:
+        """懒创建：第一次工具调用时才真正建沙箱。"""
+        sb = self.by_session.get(session_id)
+        if sb:
+            return sb
+        if len(self.by_session) &gt;= MAX_SANDBOXES:
+            raise RuntimeError("pod at capacity")  # 让 Manager 调度到别的 Pod
+        sid = f"sb-{uuid.uuid4().hex[:12]}"
+        workdir = SESSIONS / sid / "work"
+        workdir.mkdir(parents=True)
+        cg = CGROOT / sid
+        cg.mkdir()
+        (cg / "memory.max").write_text(str(2 * 1024**3))   # 2 GiB
+        (cg / "memory.swap.max").write_text("0")
+        (cg / "cpu.max").write_text("200000 100000")       # 2 核
+        (cg / "pids.max").write_text("256")                # 防 fork 炸弹
+        sb = Sandbox(sid, session_id, workdir, cg)
+        self.by_session[session_id] = sb
+        return sb
+
+    def _bwrap_argv(self, sb: Sandbox, cmd: list[str], network: bool) -&gt; list[str]:
+        argv = [
+            "bwrap",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--ro-bind", "/etc/ssl", "/etc/ssl",
+            "--bind", str(sb.workdir), "/work", "--chdir", "/work",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+            "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--unshare-cgroup-try",
+            "--die-with-parent", "--new-session",
+            "--clearenv", "--setenv", "HOME", "/work",
+            "--setenv", "PATH", "/usr/local/bin:/usr/bin",
+        ]
+        if not network:
+            argv.append("--unshare-net")   # 空网络栈；需要出网则走 egress 代理
+        return argv + ["--"] + cmd
+
+    async def exec(self, session_id: str, cmd: list[str],
+                   timeout: float = 60, network: bool = False) -&gt; dict:
+        sb = await self.get_or_create(session_id)
+        async with sb.lock:                         # 同一会话串行执行
+            sb.last_active = time.time()
+
+            def enter_cgroup() -&gt; None:              # 在子进程 exec 之前加入 cgroup
+                (sb.cgroup / "cgroup.procs").write_text(str(os.getpid()))
+
+            proc = await asyncio.create_subprocess_exec(
+                *self._bwrap_argv(sb, cmd, network),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                preexec_fn=enter_cgroup,
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            except asyncio.TimeoutError:
+                (sb.cgroup / "cgroup.kill").write_text("1")   # 杀掉整个进程树
+                await proc.wait()
+                return {"exit_code": -9, "stdout": "", "stderr": "timeout"}
+            finally:
+                sb.last_active = time.time()
+            return {"exit_code": proc.returncode,
+                    "stdout": out.decode(errors="replace")[-100_000:],
+                    "stderr": err.decode(errors="replace")[-100_000:]}
+
+    async def destroy(self, session_id: str) -&gt; None:
+        sb = self.by_session.pop(session_id, None)
+        if not sb:
+            return
+        (sb.cgroup / "cgroup.kill").write_text("1")
+        for _ in range(50):                          # 等 cgroup 清空再删除
+            if not (sb.cgroup / "cgroup.procs").read_text().strip():
+                break
+            await asyncio.sleep(0.1)
+        sb.cgroup.rmdir()
+        shutil.rmtree(sb.workdir.parent, ignore_errors=True)
+
+    async def gc_loop(self) -&gt; None:
+        """后台 GC：空闲超时 / 超过最长存活一律回收。"""
+        while True:
+            now = time.time()
+            for sid, sb in list(self.by_session.items()):
+                if now - sb.last_active &gt; IDLE_TTL or now - sb.created &gt; MAX_LIFETIME:
+                    if not sb.lock.locked():
+                        await self.destroy(sid)
+            await asyncio.sleep(30)
+</code></pre>
+<div class="callout"><strong>nsjail 等价写法</strong>nsjail 把 namespace、cgroup、rlimit、seccomp（Kafel 策略语言）集中到一个配置里，适合需要精细 syscall 策略的场景：
+<code>nsjail -Mo --chroot / --user 99999 --group 99999 --cgroup_mem_max 2147483648 --cgroup_pids_max 256 --time_limit 60 --disable_proc -- /usr/bin/python3 main.py</code></div>
+
+<h3 id="op-gvisor">5.2 方案 B：在 Pod 内调用 runsc 起多个 gVisor 沙箱</h3>
+<p>如果节点上没有配置 gVisor 的 RuntimeClass，也可以在 Pod 里直接运行 <code>runsc</code>，每个会话一个 OCI bundle。不需要 KVM，默认 <code>systrap</code> 平台即可。不过 runsc 本身也要创建 namespace 和挂载，所以同样需要 5.1 中提到的权限，实践中通常是 privileged 或 userns + SYS_ADMIN。官方的 rootless 模式（<code>runsc --rootless do</code>）限制较多：不支持 <code>runsc create</code>、不支持 save/restore、不能用 netstack。</p>
+<pre><code class="language-go">// runscpool.go —— 在 Pod 内为每个会话起一个 gVisor 沙箱（OCI bundle + runsc run）
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
+)
+
+const root = "/sessions"
+
+type ociSpec map[string]any
+
+func makeSpec(workdir string) ociSpec {
+	return ociSpec{
+		"ociVersion": "1.0.2",
+		"process": map[string]any{
+			"args": []string{"sleep", "infinity"}, // 常驻 init，后续用 runsc exec 执行命令
+			"cwd":  "/work",
+			"env":  []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/work"},
+			"user": map[string]int{"uid": 1000, "gid": 1000},
+			"rlimits": []map[string]any{
+				{"type": "RLIMIT_NOFILE", "hard": 4096, "soft": 4096},
+			},
+		},
+		"root": map[string]any{"path": "/opt/rootfs", "readonly": true}, // 共享只读 rootfs
+		"mounts": []map[string]any{
+			{"destination": "/work", "type": "bind", "source": workdir, "options": []string{"rbind", "rw"}},
+			{"destination": "/tmp", "type": "tmpfs", "source": "tmpfs"},
+			{"destination": "/proc", "type": "proc", "source": "proc"},
+		},
+		"linux": map[string]any{
+			"namespaces": []map[string]string{
+				{"type": "pid"}, {"type": "network"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"},
+			},
+			"resources": map[string]any{
+				"memory": map[string]any{"limit": 2 &lt;&lt; 30},
+				"cpu":    map[string]any{"quota": 200000, "period": 100000},
+				"pids":   map[string]any{"limit": 256},
+			},
+		},
+	}
+}
+
+// Create 起一个新的 gVisor 沙箱；--network=none 表示完全断网。
+func Create(ctx context.Context, id string) error {
+	bundle := filepath.Join(root, id)
+	work := filepath.Join(bundle, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		return err
+	}
+	spec, _ := json.Marshal(makeSpec(work))
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), spec, 0o644); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "runsc",
+		"--root=/run/runsc", "--platform=systrap", "--network=none",
+		"run", "--detach", "--bundle", bundle, id)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("runsc run: %v: %s", err, out)
+	}
+	return nil
+}
+
+// Exec 在已有沙箱中执行一条命令，带超时。
+func Exec(id string, timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	full := append([]string{"--root=/run/runsc", "exec", "--cwd", "/work", id}, args...)
+	return exec.CommandContext(ctx, "runsc", full...).CombinedOutput()
+}
+
+// Destroy 强制删除沙箱并清理工作目录。
+func Destroy(id string) {
+	_ = exec.Command("runsc", "--root=/run/runsc", "delete", "--force", id).Run()
+	_ = os.RemoveAll(filepath.Join(root, id))
+}
+
+func main() {
+	ctx := context.Background()
+	if err := Create(ctx, "sb-demo"); err != nil {
+		panic(err)
+	}
+	defer Destroy("sb-demo")
+	out, err := Exec("sb-demo", 30*time.Second, "python3", "-c", "import os; print(os.uname())")
+	fmt.Println(string(out), err) // uname 中可以看到 gVisor 模拟的内核
+}
+</code></pre>
+<div class="callout ok"><strong>✅ 更推荐的做法</strong>如果能控制节点，<strong>在节点上安装 runsc 并注册 RuntimeClass</strong>（GKE Sandbox 开箱即用），然后让沙箱宿主 Pod 用 <code>runtimeClassName: gvisor</code> 运行。这样整个 Pod 就在 gVisor 里，Pod 内再用 bwrap 按会话细分（方案 A 叠加 B），不需要 privileged。</div>
+
+<h3 id="op-fc">5.3 方案 C：特权 Pod + /dev/kvm 运行 Firecracker microVM</h3>
+<p>隔离最强，每个会话都有独立内核。需要节点支持 KVM：裸金属，或开启了<strong>嵌套虚拟化</strong>的云主机（GKE、部分 EC2 实例类型等）。Pod 需要访问 <code>/dev/kvm</code>，并且要能创建 TAP 设备（需要 <code>NET_ADMIN</code>）。最简单的是 privileged；更规范的做法是用 device plugin（如 KubeVirt 的 kvm device plugin）申请 <code>devices.kubevirt.io/kvm</code> 资源，再加上 <code>NET_ADMIN</code>。</p>
+<pre><code class="language-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: fc-host-0
+  labels: { app: fc-host }
+spec:
+  nodeSelector: { kvm: "true" }          # 只调度到支持 KVM / 嵌套虚拟化的节点
+  automountServiceAccountToken: false
+  containers:
+  - name: fc-agent
+    image: registry.example.com/fc-host:2.0   # 内含 firecracker、jailer、vmlinux、rootfs 模板
+    securityContext:
+      privileged: true                   # 或者：device plugin 提供 /dev/kvm + capabilities NET_ADMIN
+    resources:
+      limits: { cpu: "32", memory: 128Gi }
+    volumeMounts:
+    - { name: kvm, mountPath: /dev/kvm }
+    - { name: vms, mountPath: /var/lib/fc }
+  volumes:
+  - name: kvm
+    hostPath: { path: /dev/kvm, type: CharDevice }
+  - name: vms
+    emptyDir: { medium: "", sizeLimit: 500Gi }
+</code></pre>
+<pre><code class="language-go">// fcvm.go —— 通过 Firecracker 的 Unix socket REST API 启动一台 microVM（极简版）
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"time"
+)
+
+func client(sock string) *http.Client {
+	return &amp;http.Client{Transport: &amp;http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&amp;net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}}
+}
+
+func put(c *http.Client, path, body string) error {
+	req, _ := http.NewRequest(http.MethodPut, "http://localhost"+path, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode &gt;= 300 {
+		return fmt.Errorf("PUT %s: %s", path, resp.Status)
+	}
+	return nil
+}
+
+func StartVM(id string) (*exec.Cmd, error) {
+	sock := "/var/lib/fc/" + id + ".sock"
+	_ = os.Remove(sock)
+	// 生产环境应改用 jailer：chroot + cgroup + 独立 uid，再 exec firecracker
+	cmd := exec.Command("firecracker", "--api-sock", sock, "--id", id)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	time.Sleep(50 * time.Millisecond) // 简化：真实代码应轮询 socket 就绪
+	c := client(sock)
+	steps := []struct{ path, body string }{
+		{"/boot-source", `{"kernel_image_path":"/opt/fc/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off"}`},
+		// 每台 VM 一个 CoW 的 rootfs 副本（如 reflink / overlay / devmapper 快照）
+		{"/drives/rootfs", `{"drive_id":"rootfs","path_on_host":"/var/lib/fc/` + id + `.ext4","is_root_device":true,"is_read_only":false}`},
+		{"/machine-config", `{"vcpu_count":2,"mem_size_mib":1024}`},
+		{"/network-interfaces/eth0", `{"iface_id":"eth0","host_dev_name":"tap-` + id + `"}`},
+		{"/vsock", `{"guest_cid":3,"uds_path":"/var/lib/fc/` + id + `.vsock"}`}, // 宿主与 guest agent 通信
+		{"/actions", `{"action_type":"InstanceStart"}`},
+	}
+	for _, s := range steps {
+		if err := put(c, s.path, s.body); err != nil {
+			_ = cmd.Process.Kill()
+			return nil, err
+		}
+	}
+	return cmd, nil
+}
+
+func main() {
+	vm, err := StartVM("sb-001")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("microVM started, pid", vm.Process.Pid)
+	// 暂停 + 快照：PATCH /vm {"state":"Paused"}，再 PUT /snapshot/create
+	// 恢复：新进程 PUT /snapshot/load {"snapshot_path":...,"mem_backend":{...},"resume_vm":true}
+}
+</code></pre>
+<p>不想自己拼这些的话，可以用 <code>firecracker-containerd</code>、Kata（<code>kata-fc</code> RuntimeClass）、E2B 开源的 runtime，或者 microsandbox（libkrun，以库的形式嵌入，不需要守护进程）。</p>
+
+<h3 id="op-dind">5.4 方案 D：Docker-in-Docker / Sysbox / rootless Podman</h3>
+<ul>
+  <li><strong>DinD（<code>docker:dind</code>）</strong>：需要 <code>privileged: true</code>，等于把节点交出去，<span class="badge b-danger">不推荐用于不可信代码</span>。</li>
+  <li><strong>Sysbox</strong>（Nestybox，2022 年被 Docker 收购）：一个 OCI 运行时（<code>sysbox-runc</code>），让<strong>非特权</strong>容器也能在里面跑 Docker、systemd 甚至 K8s。它通过用户命名空间和对 <code>/proc</code>、<code>/sys</code> 的虚拟化实现。需要在节点上安装，并通过 RuntimeClass 使用。</li>
+  <li><strong>rootless Podman</strong>：Pod 内的非 root 用户运行 <code>podman run</code>。需要 <code>/dev/fuse</code>（fuse-overlayfs）、subuid/subgid 映射，以及能创建 userns 的权限。配合 <code>hostUsers: false</code> 体验最好。</li>
+</ul>
+<pre><code class="language-bash"># rootless podman：每个会话一个容器，带资源限制、断网、只读根
+podman run -d --name sess-42 \
+  --userns=keep-id --network=none --read-only \
+  --memory=2g --cpus=2 --pids-limit=256 \
+  --tmpfs /tmp:rw,size=512m \
+  -v /sessions/s-42/work:/work:Z -w /work \
+  --security-opt no-new-privileges --cap-drop=ALL \
+  python:3.12-slim sleep infinity
+podman exec sess-42 python -c 'print(1+1)'
+podman rm -f sess-42      # 回收
+</code></pre>
+
+<h3 id="op-common">5.5 共性问题：资源、网络、清理</h3>
+<table>
+<thead><tr><th>维度</th><th>做法</th><th>注意</th></tr></thead>
+<tbody>
+<tr><td>CPU / 内存 / PID</td><td>每个沙箱一个 cgroup v2 子组：<code>cpu.max</code>、<code>memory.max</code>、<code>pids.max</code>；Pod 本身的 limit 作为总上限</td><td>Pod 内的 cgroup 默认只读，需要 cgroupns 委派（privileged 或 userns 下以可写方式挂载），否则只能退回 rlimit 或交给 runsc/VM 自己限制</td></tr>
+<tr><td>磁盘</td><td>工作目录放在 <code>emptyDir</code> 上并设 <code>sizeLimit</code>；每个会话用 XFS project quota 或 loop 设备镜像限额</td><td>超出 emptyDir 上限会导致整个 Pod 被驱逐，单会话必须单独限额</td></tr>
+<tr><td>工作目录</td><td><code>/sessions/&lt;id&gt;/work</code>，只把它以可写方式挂进沙箱</td><td>ID 用随机值，防止路径穿越；产物上传对象存储后再删除</td></tr>
+<tr><td>网络</td><td>默认 <code>--unshare-net</code> 断网；需要出网时走 egress 代理（Unix socket 桥接，参考 srt / Codex）或每个会话一个 netns + veth + nftables</td><td>屏蔽 169.254.169.254（云元数据）、集群内网段、K8s API；Pod 级别再加 NetworkPolicy 兜底</td></tr>
+<tr><td>时间</td><td>单次 exec 超时 + 会话空闲 TTL + 最长存活时间</td><td>超时用 <code>cgroup.kill</code> 杀掉整棵进程树，避免僵尸和孤儿进程</td></tr>
+<tr><td>清理 / GC</td><td>GC 循环 + 启动时对账（扫描磁盘和 cgroup 中不在注册表里的残留）+ Pod 终止时的 preStop 钩子</td><td>节点 Agent 崩溃后要能恢复；用 <code>--die-with-parent</code>、<code>PR_SET_PDEATHSIG</code> 防止泄漏</td></tr>
+<tr><td>调度</td><td>Manager 维护各 Pod 的容量，会话亲和到同一个 Pod（有状态）</td><td>Pod 缩容前先 drain：停止接新会话，等现有会话结束或迁移快照</td></tr>
+</tbody>
+</table>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="tradeoff">
+<h2>6. 对比：一 Pod 多沙箱 vs 一 Pod 一沙箱 &amp; agent-sandbox CRD</h2>
+<table>
+<thead><tr><th>维度</th><th>一 Pod 多沙箱</th><th>一 Pod 一沙箱</th></tr></thead>
+<tbody>
+<tr><td>启动延迟</td><td>毫秒到百毫秒（进程 / runsc / 快照恢复）</td><td>秒级（调度、镜像、CNI）；可以用预热池掩盖</td></tr>
+<tr><td>密度 / 成本</td><td>高，几百个共享一个大 Pod</td><td>每个 Pod 都有固定开销（pause 容器、kubelet、etcd 对象）</td></tr>
+<tr><td>隔离</td><td>取决于内层技术；Pod 往往需要更高权限</td><td>K8s 原生边界加 RuntimeClass（gVisor/Kata），权限模型清晰</td></tr>
+<tr><td>可观测性 / 运维</td><td>需要自己实现调度、配额、GC、监控</td><td>直接复用 K8s 的 RBAC、NetworkPolicy、ResourceQuota、日志和指标</td></tr>
+<tr><td>故障域</td><td>一个 Pod 挂掉会影响上面的所有会话</td><td>互不影响</td></tr>
+<tr><td>K8s 控制面压力</td><td>低</td><td>高并发时 API Server / 调度器会成为瓶颈</td></tr>
+</tbody>
+</table>
+
+<h3>6.1 kubernetes-sigs/agent-sandbox</h3>
+<p>由 SIG Apps 推动的官方子项目，核心是 <code>Sandbox</code> CRD（<code>agents.x-k8s.io/v1beta1</code>），用来描述“单实例、有状态、身份稳定、可带持久存储”的 Pod，可以理解为 K8s 上的轻量 VM。扩展 CRD（<code>extensions.agents.x-k8s.io/v1beta1</code>）包括 <code>SandboxTemplate</code>、<code>SandboxClaim</code>、<code>SandboxWarmPool</code>。官方文档列出的能力还有休眠与恢复（hibernation）、按时间自动删除（<code>shutdownTime</code>），并兼容 gVisor、Kata 等运行时，同时提供 Python 和 Go SDK。</p>
+<pre class="mermaid">
+flowchart LR
+    T["SandboxTemplate<br/>(平台团队维护：镜像、runtimeClass、NetworkPolicy)"]
+    WP["SandboxWarmPool<br/>replicas: N"] -->|引用| T
+    WP -->|预热| S1["Sandbox (空闲)"]
+    C["SandboxClaim<br/>(Agent 按会话创建)"] -->|"warmPoolRef 认领"| S1
+    S1 -->|创建/持有| P["Pod (gVisor / Kata)"]
+</pre>
+<pre><code class="language-yaml"># 字段以官方 API 文档为准（v1beta1，2026-10 核对）
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata: { name: python-gvisor }
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      automountServiceAccountToken: false
+      containers:
+      - name: runtime
+        image: registry.example.com/py-sandbox:3.12
+        resources: { limits: { cpu: "2", memory: 2Gi } }
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata: { name: python-pool }
+spec:
+  replicas: 20
+  sandboxTemplateRef: { name: python-gvisor }
+  updateStrategy: { type: OnReplenish }   # 或 Recreate：模板变化后立即替换空闲沙箱
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata: { name: session-7f3a }
+spec:
+  warmPoolRef: { name: python-pool }
+  lifecycle:
+    shutdownTime: "2026-10-10T02:00:00Z"   # 到期由控制器删除沙箱
+    shutdownPolicy: Delete
+</code></pre>
+<div class="callout warn"><strong>⚠️ 会触发冷启动的字段</strong>官方 API 文档注明：如果 <code>SandboxClaim</code> 里指定了 <code>env</code> 或 <code>volumeClaimTemplates</code>，就无法从预热池认领，只能按模板冷启动。另外，通过模板创建时，如果没有指定 <code>automountServiceAccountToken</code>，控制器默认设为 <code>false</code>（默认安全）。</div>
+<p><strong>怎么选：</strong>会话量在几百到几千、需要强隔离和 K8s 原生治理的，选 agent-sandbox + gVisor/Kata + 预热池。会话量极大、单会话很轻（短代码片段）、对延迟非常敏感的，选“一 Pod 多沙箱”。两者也可以组合：用 agent-sandbox 管理一批大规格的沙箱宿主 Pod，Pod 内再细分。</p>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="survey">
+<h2>7. 轻量沙箱项目全景对比</h2>
+<p>启动时间均为<strong>官方或厂商自报</strong>的数字（2026-10 核对），测量口径各不相同，仅供参考，务必在自己的负载上实测。</p>
+<table>
+<thead><tr><th>项目</th><th>类型</th><th>隔离技术</th><th>启动时间（自报）</th><th>开源 / 形态</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td><a href="https://e2b.dev" target="_blank" rel="noopener">E2B</a></td><td>云服务 + 开源 runtime</td><td>Firecracker microVM</td><td>同区域 &lt;200ms（另有 80ms 的说法）；第三方常引用约 150ms</td><td>runtime 开源（<code>e2b-dev/runtime</code>）</td><td>“创建”就是恢复预启动快照（userfaultfd 按需加载 + CoW）；支持 pause/resume、fork、空闲自动暂停</td></tr>
+<tr><td><a href="https://www.daytona.io" target="_blank" rel="noopener">Daytona</a></td><td>云服务</td><td>默认容器（另有 VM / GPU 规格）</td><td>&lt;90ms（从快照创建，从代码到执行）</td><td><span class="badge b-warn">2026-06 转闭源</span> 旧仓库保留 AGPL 但不再维护；客户端 SDK 改为 Apache-2.0</td><td>有状态沙箱，支持快照、fork、恢复</td></tr>
+<tr><td><a href="https://github.com/superradcompany/microsandbox" target="_blank" rel="noopener">microsandbox</a></td><td>本地库 / 自托管</td><td>libkrun microVM（KVM / HVF）</td><td>README：平均启动 &lt;100ms（M1 上 guest 启动）；官方基准端到端中位数 320ms（对比 Docker 463ms、Firecracker 808ms）</td><td>Apache-2.0，beta</td><td>无守护进程、无 root；网络层注入密钥（密钥不进 VM）；支持快照、fork；兼容 OCI 镜像</td></tr>
+<tr><td><a href="https://gvisor.dev" target="_blank" rel="noopener">gVisor</a></td><td>OCI 运行时</td><td>用户态内核（Sentry）</td><td>接近容器（官方没有统一数字）</td><td>Apache-2.0（Google）</td><td>GKE Sandbox、Modal 在用；不需要 KVM</td></tr>
+<tr><td><a href="https://firecracker-microvm.github.io" target="_blank" rel="noopener">Firecracker</a></td><td>VMM</td><td>KVM microVM</td><td>≤125ms 到 <code>/sbin/init</code>（规格口径）；快照加载为毫秒级</td><td>Apache-2.0（AWS）</td><td>VMM 内存开销 ≤5MiB；生产环境配合 jailer</td></tr>
+<tr><td><a href="https://katacontainers.io" target="_blank" rel="noopener">Kata Containers</a></td><td>OCI 运行时</td><td>microVM（QEMU / CLH / FC / Dragonball）</td><td>通常在百毫秒到 1 秒之间（官方没有统一数字）</td><td>Apache-2.0（OpenInfra）</td><td>K8s 中通过 RuntimeClass 使用；需要 KVM</td></tr>
+<tr><td><a href="https://github.com/google/nsjail" target="_blank" rel="noopener">nsjail</a></td><td>CLI</td><td>namespace + cgroup + rlimit + seccomp（Kafel）</td><td>毫秒级（进程启动）</td><td>Apache-2.0（Google）</td><td>CTF、在线评测常用；策略表达能力强</td></tr>
+<tr><td><a href="https://github.com/containers/bubblewrap" target="_blank" rel="noopener">bubblewrap</a></td><td>CLI</td><td>非特权 namespace</td><td>毫秒级</td><td>LGPL-2.0+（Flatpak 底座）</td><td>srt、Codex 的 Linux 后端都基于它</td></tr>
+<tr><td><a href="https://github.com/anthropic-experimental/sandbox-runtime" target="_blank" rel="noopener">Anthropic sandbox-runtime（srt）</a></td><td>CLI / npm 库</td><td>macOS Seatbelt；Linux bubblewrap + netns；Windows 专用账户 + WFP（alpha）</td><td>毫秒级</td><td>Apache-2.0（<code>@anthropic-ai/sandbox-runtime</code>）</td><td>基于代理的域名白名单出网；可用来包裹 Agent、MCP server、任意进程</td></tr>
+<tr><td><a href="https://github.com/openai/codex/tree/main/codex-rs/linux-sandbox" target="_blank" rel="noopener">OpenAI Codex 沙箱</a></td><td>CLI 内置</td><td>macOS Seatbelt；Linux bubblewrap + seccomp + no_new_privs（Landlock 为旧后备方案）</td><td>毫秒级</td><td>Apache-2.0</td><td>默认只读，按根目录开放写权限；<code>.git</code>、<code>.codex</code> 等路径保持只读；托管代理模式</td></tr>
+<tr><td><a href="https://wasmtime.dev" target="_blank" rel="noopener">Wasmtime</a></td><td>Wasm 运行时</td><td>Wasm + WASI 能力模型</td><td>pooling allocator 下约 5µs 实例化（小模块基准）</td><td>Apache-2.0（Bytecode Alliance）</td><td>只能运行 wasm；适合插件和函数</td></tr>
+<tr><td><a href="https://wasmedge.org" target="_blank" rel="noopener">WasmEdge</a></td><td>Wasm 运行时</td><td>Wasm + WASI</td><td>未找到可核实的官方数字</td><td>Apache-2.0（CNCF）</td><td>面向边缘和云原生，有 AOT 编译</td></tr>
+<tr><td><a href="https://modal.com/docs/guide/sandboxes" target="_blank" rel="noopener">Modal Sandboxes</a></td><td>云服务</td><td>gVisor</td><td>大规模下 time-to-interactive 中位数 &lt;0.5s（官方博客）</td><td>闭源</td><td>官方博客介绍过“秒级扩到 100 万并发沙箱”；区分 Started 和 Ready；支持内存快照</td></tr>
+<tr><td><a href="https://github.com/kubernetes-sigs/agent-sandbox" target="_blank" rel="noopener">kubernetes-sigs/agent-sandbox</a></td><td>K8s CRD + 控制器</td><td>取决于 RuntimeClass（runc / gVisor / Kata）</td><td>预热池认领为毫秒级（文档描述）；冷启动等于 Pod 启动时间</td><td>Apache-2.0（SIG Apps）</td><td>Sandbox、Template、Claim、WarmPool；支持休眠和 TTL；Python / Go SDK</td></tr>
+<tr><td><a href="https://github.com/nestybox/sysbox" target="_blank" rel="noopener">Sysbox</a></td><td>OCI 运行时</td><td>userns + procfs/sysfs 虚拟化</td><td>接近 runc</td><td>Apache-2.0（Docker 旗下）</td><td>非特权跑 DinD / systemd</td></tr>
+</tbody>
+</table>
+<div class="callout"><strong>📏 读启动时间要看口径</strong>“VMM 启动到 init”、“从快照恢复”、“SDK 调用到第一条命令可执行（ready）”、“端到端 CLI 退出”是完全不同的度量。比如 E2B 的“创建”其实是快照恢复，Modal 专门写文章区分 Started 和 Ready，microsandbox 的 README 数字和基准数字也不是同一个口径。</div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="choose">
+<h2>8. 选型建议</h2>
+<pre class="mermaid">
+flowchart TD
+    Q0{"运行的代码来自谁?"} -->|"自己 / 本地开发"| A1["OS 原生沙箱<br/>srt / Codex 沙箱 / bubblewrap"]
+    Q0 -->|"多租户 / 陌生人"| Q1{"能自建基础设施吗?"}
+    Q1 -->|否| A2["托管服务<br/>E2B / Modal / Daytona"]
+    Q1 -->|是| Q2{"节点有 KVM（裸金属 / 嵌套虚拟化）?"}
+    Q2 -->|有| Q3{"会话量 / 延迟要求"}
+    Q2 -->|没有| A3["gVisor RuntimeClass<br/>+ agent-sandbox 预热池<br/>或 Pod 内 runsc / bwrap"]
+    Q3 -->|"中等, 要 K8s 原生治理"| A4["Kata RuntimeClass + agent-sandbox"]
+    Q3 -->|"极高密度, 毫秒级"| A5["Pod 内 Firecracker / microsandbox<br/>+ 快照恢复 + 自研调度"]
+    Q0 -->|"仅插件 / 函数"| A6["Wasmtime / WasmEdge"]
+</pre>
+<div class="grid2">
+  <div class="card"><h4>🔐 安全底线</h4>不可信代码至少要有独立内核这一级（gVisor 或 microVM）；凭据不进沙箱；默认断网，出网走白名单代理；屏蔽元数据地址。</div>
+  <div class="card"><h4>⚡ 延迟</h4>懒创建 + 预热池 + 快照恢复是三板斧；度量以 Ready 为准，而不是 Started。</div>
+  <div class="card"><h4>💰 成本</h4>空闲 TTL 后先暂停（保存快照）再销毁；会话级 CPU/内存配额；高密度场景用一 Pod 多沙箱。</div>
+  <div class="card"><h4>🧹 可靠性</h4>GC + 启动时对账 + 进程树级强杀 + 磁盘配额，防止资源泄漏拖垮节点。</div>
+</div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="refs">
+<h2>9. 参考资料</h2>
+<ol class="refs">
+  <li><a href="https://agent-sandbox.sigs.k8s.io/docs/" target="_blank" rel="noopener">Agent Sandbox 文档（kubernetes-sigs）</a> · <a href="https://agent-sandbox.sigs.k8s.io/docs/api/" target="_blank" rel="noopener">API 参考</a> · <a href="https://agent-sandbox.sigs.k8s.io/docs/use-cases/examples/warmpool-quickstart/" target="_blank" rel="noopener">Warm Pool Quickstart</a> · <a href="https://agent-sandbox.sigs.k8s.io/docs/use-cases/examples/firecracker-sandbox/" target="_blank" rel="noopener">Firecracker Sandbox 示例</a></li>
+  <li><a href="https://github.com/kubernetes-sigs/agent-sandbox" target="_blank" rel="noopener">github.com/kubernetes-sigs/agent-sandbox</a></li>
+  <li><a href="https://github.com/e2b-dev/runtime" target="_blank" rel="noopener">E2B Runtime（快照恢复、pause/resume、fork 架构）</a></li>
+  <li><a href="https://www.daytona.io/dotfiles/updates/daytona-is-going-closed-source" target="_blank" rel="noopener">Daytona is going closed source</a> · <a href="https://www.daytona.io/changelog/client-repo-restructure-and-apache-20-relicense" target="_blank" rel="noopener">客户端 Apache-2.0 重新授权</a></li>
+  <li><a href="https://bex.co/blog/2026/09/18/daytona-sub-90ms-vs-e2b-150ms-sandbox-cold-start" target="_blank" rel="noopener">Daytona sub-90ms vs E2B 150ms（第三方分析）</a></li>
+  <li><a href="https://github.com/superradcompany/microsandbox" target="_blank" rel="noopener">microsandbox</a> · <a href="https://microsandbox.dev/platform/local" target="_blank" rel="noopener">基准说明</a> · <a href="https://github.com/superradcompany/sandbox-bench" target="_blank" rel="noopener">sandbox-bench</a></li>
+  <li><a href="https://gvisor.dev/docs/" target="_blank" rel="noopener">gVisor 文档</a> · <a href="https://gvisor.dev/docs/user_guide/rootless/" target="_blank" rel="noopener">gVisor Rootless</a></li>
+  <li><a href="https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md" target="_blank" rel="noopener">Firecracker SPECIFICATION（125ms / 5MiB）</a> · <a href="https://firecracker-microvm.github.io/" target="_blank" rel="noopener">官网</a> · <a href="https://github.com/firecracker-microvm/firecracker-containerd" target="_blank" rel="noopener">firecracker-containerd</a></li>
+  <li><a href="https://katacontainers.io/" target="_blank" rel="noopener">Kata Containers</a></li>
+  <li><a href="https://github.com/google/nsjail" target="_blank" rel="noopener">nsjail</a> · <a href="https://github.com/containers/bubblewrap" target="_blank" rel="noopener">bubblewrap</a></li>
+  <li><a href="https://github.com/anthropic-experimental/sandbox-runtime" target="_blank" rel="noopener">Anthropic sandbox-runtime</a> · <a href="https://www.npmjs.com/package/@anthropic-ai/sandbox-runtime" target="_blank" rel="noopener">npm 包</a></li>
+  <li><a href="https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/README.md" target="_blank" rel="noopener">OpenAI Codex linux-sandbox README</a></li>
+  <li><a href="https://docs.wasmtime.dev/examples-fast-instantiation.html" target="_blank" rel="noopener">Wasmtime Fast Instantiation</a> · <a href="https://github.com/bytecodealliance/wasmtime/pull/2900" target="_blank" rel="noopener">实例化基准 PR #2900</a> · <a href="https://wasmedge.org/" target="_blank" rel="noopener">WasmEdge</a></li>
+  <li><a href="https://modal.com/docs/guide/sandboxes" target="_blank" rel="noopener">Modal Sandboxes</a> · <a href="https://modal.com/blog/scaling-to-1-million-concurrent-sandboxes-in-seconds" target="_blank" rel="noopener">Scaling to 1M concurrent sandboxes</a> · <a href="https://modal.com/blog/unpacking-sandbox-startup-latency" target="_blank" rel="noopener">Started ≠ Ready</a></li>
+  <li><a href="https://kubernetes.io/blog/2026/04/23/kubernetes-v1-36-userns-ga/" target="_blank" rel="noopener">Kubernetes v1.36：User Namespaces GA</a> · <a href="https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/" target="_blank" rel="noopener">User Namespaces 文档</a></li>
+  <li><a href="https://cloud.google.com/kubernetes-engine/docs/how-to/nested-virtualization" target="_blank" rel="noopener">GKE 嵌套虚拟化</a></li>
+  <li><a href="https://github.com/nestybox/sysbox" target="_blank" rel="noopener">Sysbox</a></li>
+</ol>
+<p style="color:var(--muted);font-size:13px">项目信息与数字于 2026-10-09 核对。厂商的启动时间均为自报数字，代码示例为教学用的简化版本，生产使用前请补全错误处理和安全加固。</p>
+</section>

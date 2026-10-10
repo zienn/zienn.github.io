@@ -1,0 +1,16 @@
+{
+  "name": "my-tech-blog",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "极简静态技术博客生成器（零框架，单文件构建脚本）",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --watch",
+    "preview": "node scripts/serve.mjs dist 4321",
+    "new": "node scripts/new-post.mjs"
+  },
+  "dependencies": {
+    "marked": "^18.0.0"
+  }
+}
