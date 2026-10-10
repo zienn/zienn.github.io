@@ -67,38 +67,52 @@ function buildToc(html) {
 }
 
 // ---------- 页面骨架 ----------
-function layout({ title, rel, body, desc = cfg.subtitle, extraHead = "" }) {
+const ICON = {
+  search: `<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`,
+  sun: `<svg class="i-sun" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`,
+  moon: `<svg class="i-moon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M19.5 14.5A8 8 0 0 1 9.5 4.5a8 8 0 1 0 10 10z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>`,
+};
+
+function layout({ title, rel, body, desc = cfg.subtitle, path: here = "", active = "" }) {
+  const nav = (key, href, label) => `<a href="${rel}${href}"${active === key ? ' aria-current="page"' : ""}>${label}</a>`;
   return `<!DOCTYPE html>
-<html lang="${cfg.lang}">
+<html lang="${cfg.lang}" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(desc)}">
-<script>(function(){var t=localStorage.getItem("theme");if(!t)t=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";document.documentElement.dataset.theme=t;})();</script>
+<meta name="color-scheme" content="dark light">
+<script>(function(){var q=new URLSearchParams(location.search).get("theme");if(q==="light"||q==="dark")localStorage.setItem("theme",q);var t=localStorage.getItem("theme")||"dark";document.documentElement.dataset.theme=t;})();</script>
+<link rel="preload" href="${rel}assets/fonts/ibm-plex-mono-latin-500-normal.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="${rel}assets/style.css">
-<link rel="stylesheet" id="hljs-light" href="${HLJS}/styles/github.min.css">
-<link rel="stylesheet" id="hljs-dark" href="${HLJS}/styles/github-dark.min.css">
-${extraHead}
 </head>
 <body>
-<header class="topbar">
-  <div class="topbar-inner">
-    <a class="brand" href="${rel}index.html">🧭 ${esc(cfg.title)}</a>
-    <nav class="topnav">
-      <a href="${rel}index.html">首页</a>
-      <a href="${rel}tags/index.html">标签 / 分类</a>
-      <a href="${rel}about.html">关于</a>
+<a class="skip" href="#content">跳到正文</a>
+<header class="masthead">
+  <div class="masthead-inner">
+    <a class="mark" href="${rel}index.html" aria-label="${esc(cfg.title)} 首页"><span class="mark-path">~/</span><span class="mark-name">${esc(cfg.handle || "zienn")}</span><span class="caret" aria-hidden="true"></span></a>
+    <nav class="sitenav" aria-label="主导航">
+      ${nav("home", "index.html", "文章")}
+      ${nav("tags", "tags/index.html", "标签")}
+      ${nav("about", "about.html", "关于")}
     </nav>
-    <div class="search">
-      <input id="search-input" type="search" placeholder="搜索文章…  (按 / 聚焦)" autocomplete="off" aria-label="搜索">
+    <div class="search" role="search">
+      <label class="search-field">
+        ${ICON.search}
+        <input id="search-input" type="search" placeholder="搜索标题、标签、正文" autocomplete="off" aria-label="搜索文章">
+        <kbd>/</kbd>
+      </label>
       <div id="search-results" class="search-results" hidden></div>
     </div>
-    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换深色/浅色">🌓</button>
+    <button id="theme-toggle" class="icon-btn" type="button" aria-label="切换深色 / 浅色">${ICON.sun}${ICON.moon}</button>
   </div>
+  ${here ? `<div class="runninghead"><div class="masthead-inner"><span>${esc(here)}</span></div></div>` : ""}
 </header>
+<div id="content">
 ${body}
-<footer class="site-footer">© ${new Date().getFullYear()} ${esc(cfg.author)} · ${esc(cfg.title)} · 由自制静态生成器构建</footer>
+</div>
+<footer class="site-footer"><div class="footer-inner"><span>© ${new Date().getFullYear()} ${esc(cfg.author)}</span><span>静态生成 · 无追踪 · <a href="${rel}index.html">回到首页</a></span></div></footer>
 <script>window.SITE_REL=${JSON.stringify(rel)};</script>
 <script src="${rel}search-index.js"></script>
 <script src="${HLJS}/highlight.min.js"></script>
@@ -115,15 +129,17 @@ ${body}
 </html>`;
 }
 
-const tagChips = (tags, rel) => tags.map((t) => `<a class="chip" href="${rel}tags/index.html#${tagId(t)}">#${esc(t)}</a>`).join("");
+const tagLinks = (tags, rel) => tags.map((t) => `<a class="tag" href="${rel}tags/index.html#${tagId(t)}">#${esc(t)}</a>`).join("");
 
-function postCard(p, rel) {
-  return `<article class="post-card">
-  <div class="post-meta"><time datetime="${p.date}">${p.date}</time>${p.category ? ` · <span>${esc(p.category)}</span>` : ""} · 约 ${p.minutes} 分钟</div>
-  <h2><a href="${rel}posts/${p.slug}.html">${esc(p.title)}</a></h2>
-  <p>${esc(p.summary || "")}</p>
-  <div class="chips">${tagChips(p.tags, rel)}</div>
-</article>`;
+function postRow(p, rel) {
+  return `<li class="entry">
+  <time class="entry-date" datetime="${p.date}">${p.date}</time>
+  <div class="entry-main">
+    <h2 class="entry-title"><a href="${rel}posts/${p.slug}.html">${esc(p.title)}</a></h2>
+    <p class="entry-summary">${esc(p.summary || "")}</p>
+    <div class="entry-meta"><span>${esc(p.category || "未分类")}</span><span>${p.minutes} min</span>${tagLinks(p.tags, rel)}</div>
+  </div>
+</li>`;
 }
 
 // ---------- 构建 ----------
@@ -154,24 +170,24 @@ function build() {
     const rel = "../";
     const prev = posts[i + 1], next = posts[i - 1];
     const body = `<div class="post-layout${p.tocCount ? "" : " no-toc"}">
-  ${p.tocCount ? `<aside class="post-toc"><div class="toc-title">📑 目录</div><nav id="toc">${p.tocHtml}</nav></aside>` : ""}
-  <main class="post">
-    <header class="hero">
-      <div class="post-meta"><time datetime="${p.date}">${p.date}</time>${p.category ? ` · ${esc(p.category)}` : ""} · 约 ${p.minutes} 分钟阅读</div>
+  <article class="post">
+    <header class="post-head">
       <h1>${esc(p.title)}</h1>
-      ${p.summary ? `<p>${esc(p.summary)}</p>` : ""}
-      <div class="chips">${tagChips(p.tags, rel)}</div>
+      ${p.summary ? `<p class="lede">${esc(p.summary)}</p>` : ""}
+      <div class="post-meta"><time datetime="${p.date}">${p.date}</time><span>${esc(p.category || "未分类")}</span><span>约 ${p.minutes} 分钟</span>${tagLinks(p.tags, rel)}</div>
     </header>
+    ${p.tocCount ? `<details class="toc-inline"><summary>目录</summary><nav>${p.tocHtml}</nav></details>` : ""}
     <div class="post-body">
 ${p.html}
     </div>
-    <nav class="post-nav">
-      ${prev ? `<a href="${prev.slug}.html">← ${esc(prev.title)}</a>` : "<span></span>"}
-      ${next ? `<a href="${next.slug}.html">${esc(next.title)} →</a>` : "<span></span>"}
+    <nav class="post-nav" aria-label="相邻文章">
+      ${prev ? `<a rel="prev" href="${prev.slug}.html"><span>上一篇</span>${esc(prev.title)}</a>` : "<span></span>"}
+      ${next ? `<a rel="next" href="${next.slug}.html"><span>下一篇</span>${esc(next.title)}</a>` : "<span></span>"}
     </nav>
-  </main>
+  </article>
+  ${p.tocCount ? `<aside class="post-toc" aria-label="文章目录"><div class="toc-title">目录</div><nav id="toc">${p.tocHtml}</nav><a class="toc-top" href="#content">回到顶部 ↑</a></aside>` : ""}
 </div>`;
-    fs.writeFileSync(path.join(OUT, "posts", `${p.slug}.html`), layout({ title: `${p.title} | ${cfg.title}`, rel, body, desc: p.summary }));
+    fs.writeFileSync(path.join(OUT, "posts", `${p.slug}.html`), layout({ title: `${p.title} | ${cfg.title}`, rel, body, desc: p.summary, path: `~/posts/${p.slug}.html`, active: "home" }));
   });
 
   // 标签 / 分类聚合
@@ -189,40 +205,47 @@ ${p.html}
   {
     const rel = "";
     const body = `<main class="home">
-  <section class="home-hero">
+  <section class="intro">
     <h1>${esc(cfg.title)}</h1>
     <p>${esc(cfg.subtitle)}</p>
-    <div class="stats">${posts.length} 篇文章 · ${tags.length} 个标签 · ${cats.length} 个分类</div>
   </section>
   <div class="home-grid">
-    <div class="post-list" id="post-list">
-      ${posts.map((p) => postCard(p, rel)).join("\n")}
-    </div>
-    <aside class="sidebar">
-      <div class="side-card"><h3>📂 分类</h3><ul>${cats.map(([c, ps]) => `<li><a href="tags/index.html#${tagId("cat:" + c)}">${esc(c)}</a> <span class="count">${ps.length}</span></li>`).join("")}</ul></div>
-      <div class="side-card"><h3>🏷️ 标签</h3><div class="chips">${tags.map(([t, ps]) => `<a class="chip" href="tags/index.html#${tagId(t)}">#${esc(t)} <span class="count">${ps.length}</span></a>`).join("")}</div></div>
+    <section aria-labelledby="latest">
+      <h2 id="latest" class="list-head">全部文章</h2>
+      <ol class="entries" id="post-list">
+      ${posts.map((p) => postRow(p, rel)).join("\n")}
+      </ol>
+    </section>
+    <aside class="rail" aria-label="分类与标签">
+      <h2 class="rail-head">分类</h2>
+      <ul class="index-list">${cats.map(([c, ps]) => `<li><a href="tags/index.html#${tagId("cat:" + c)}">${esc(c)}</a><span class="count">${ps.length}</span></li>`).join("")}</ul>
+      <h2 class="rail-head">标签</h2>
+      <div class="tag-cloud">${tags.map(([t, ps]) => `<a class="tag" href="tags/index.html#${tagId(t)}">#${esc(t)}<span class="count">${ps.length}</span></a>`).join("")}</div>
     </aside>
   </div>
 </main>`;
-    fs.writeFileSync(path.join(OUT, "index.html"), layout({ title: cfg.title, rel, body }));
+    fs.writeFileSync(path.join(OUT, "index.html"), layout({ title: cfg.title, rel, body, active: "home" }));
   }
 
   // 标签页
   {
     const rel = "../";
-    const list = (ps) => `<ul class="tag-posts">${ps.map((p) => `<li><time>${p.date}</time> <a href="../posts/${p.slug}.html">${esc(p.title)}</a></li>`).join("")}</ul>`;
-    const body = `<main class="tags-page">
-  <h1>📂 分类</h1>
-  <div class="tag-groups">${cats.map(([c, ps]) => `<section class="tag-group" id="${tagId("cat:" + c)}"><h2>${esc(c)} <span class="count">${ps.length}</span></h2>${list(ps)}</section>`).join("")}</div>
-  <h1>🏷️ 标签</h1>
-  <div class="chips big">${tags.map(([t, ps]) => `<a class="chip" href="#${tagId(t)}">#${esc(t)} <span class="count">${ps.length}</span></a>`).join("")}</div>
-  <div class="tag-groups">${tags.map(([t, ps]) => `<section class="tag-group" id="${tagId(t)}"><h2>#${esc(t)} <span class="count">${ps.length}</span></h2>${list(ps)}</section>`).join("")}</div>
+    const list = (ps) => `<ul class="tag-posts">${ps.map((p) => `<li><time>${p.date}</time><a href="../posts/${p.slug}.html">${esc(p.title)}</a></li>`).join("")}</ul>`;
+    const groups = (arr, pre, prefix) => arr.map(([k, ps]) => `<section class="tag-group" id="${tagId(pre + k)}"><h3>${prefix}${esc(k)}<span class="count">${ps.length}</span></h3>${list(ps)}</section>`).join("");
+    const body = `<main class="page">
+  <h1>标签与分类</h1>
+  <p class="lede">${posts.length} 篇文章按分类和标签归档。点任意标签跳到对应列表。</p>
+  <div class="tag-cloud big">${tags.map(([t, ps]) => `<a class="tag" href="#${tagId(t)}">#${esc(t)}<span class="count">${ps.length}</span></a>`).join("")}</div>
+  <h2 class="list-head">分类</h2>
+  <div class="tag-groups">${groups(cats, "cat:", "")}</div>
+  <h2 class="list-head">标签</h2>
+  <div class="tag-groups">${groups(tags, "", "#")}</div>
 </main>`;
-    fs.writeFileSync(path.join(OUT, "tags", "index.html"), layout({ title: `标签 / 分类 | ${cfg.title}`, rel, body }));
+    fs.writeFileSync(path.join(OUT, "tags", "index.html"), layout({ title: `标签 / 分类 | ${cfg.title}`, rel, body, path: "~/tags/", active: "tags" }));
   }
 
   // 关于页
-  fs.writeFileSync(path.join(OUT, "about.html"), layout({ title: `关于 | ${cfg.title}`, rel: "", body: `<main class="tags-page"><h1>关于</h1>
+  fs.writeFileSync(path.join(OUT, "about.html"), layout({ title: `关于 | ${cfg.title}`, rel: "", active: "about", path: "~/about.html", body: `<main class="page"><h1>关于</h1>
 <p>这里记录我对 Android、AI 基础设施和系统原理的学习与思考。复杂的概念尽量配上流程图、源码和可运行的示例。</p>
 <p>本站由一个约 300 行的 Node.js 脚本生成，纯静态，可部署到 GitHub Pages / Vercel / Cloudflare Pages。</p></main>` }));
 
@@ -230,7 +253,7 @@ ${p.html}
   const index = posts.map((p) => ({ t: p.title, s: p.summary || "", g: p.tags, c: p.category || "", d: p.date, u: `posts/${p.slug}.html`, x: p.text.slice(0, 30000) }));
   fs.writeFileSync(path.join(OUT, "search-index.js"), "window.SEARCH_INDEX=" + JSON.stringify(index) + ";\n");
   fs.writeFileSync(path.join(OUT, ".nojekyll"), "");
-  fs.writeFileSync(path.join(OUT, "404.html"), layout({ title: "404", rel: (cfg.base || "") + "/", body: `<main class="tags-page"><h1>404 · 页面不存在</h1><p><a href="${(cfg.base || "") + "/"}index.html">返回首页</a></p></main>` }));
+  fs.writeFileSync(path.join(OUT, "404.html"), layout({ title: "404", rel: (cfg.base || "") + "/", body: `<main class="page"><h1>404 · 页面不存在</h1><p><a href="${(cfg.base || "") + "/"}index.html">返回首页</a></p></main>` }));
 
   console.log(`✔ 构建完成：${posts.length} 篇文章，${tags.length} 个标签 → dist/ (${Date.now() - t0}ms)`);
 }

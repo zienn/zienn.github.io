@@ -45,6 +45,7 @@ flowchart TB
       G4 -->|"virtio / KVM 退出"| V4["VMM: Firecracker / Cloud Hypervisor / QEMU"]
       V4 --> K4["宿主 Linux 内核 + KVM"]
     end
+    L1 ~~~ L3 ~~~ L4
 </pre>
 
 <h3 id="lv-process">2.1 进程级：namespace + seccomp</h3>
