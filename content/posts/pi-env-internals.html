@@ -1,0 +1,314 @@
+---
+title: pi-env 源码精读：用一个 Rust 守护进程把 Agent 的执行环境搬到远端
+date: 2026-10-12
+tags: AI Agent, Rust, 远程执行, SSH, 协议设计
+category: AI 基础设施
+summary: 逐文件拆解 @earendil-works/pi-env：PI-ENV 同步行与二进制帧协议、控制/批量双队列输出、exec/pty/watch 守护模块、按 SHA-256 部署与主机密钥流程、与 NodeExecutionEnv 的语义对齐及差分测试、SSH 加固与 Windows 细节。
+---
+<div class="callout">本文基于 <a href="https://github.com/earendil-works/pi/tree/main/packages/env">earendil-works/pi · packages/env</a>，提交 <code>6db4070f175b55c76dfb4a292716c76368e7f31d</code>（2026-10-12 UTC）。所有代码片段均摘自该提交，路径相对于 <code>packages/env/</code>；为了篇幅，部分片段有删节（以 <code>…</code> 标出），但没有改写逻辑。</div>
+
+<section id="overview">
+<h2>1. 它解决什么问题：整体架构</h2>
+<p>pi 的 Durable 运行时通过 <code>ExecutionEnv</code> 接口操作文件和执行命令（<code>packages/durable/src/env/index.ts</code>：<code>interface ExecutionEnv extends FileSystem, Shell {}</code>，包含 <code>readTextFile</code>、<code>openBinaryReader</code>、<code>writeFile</code>、<code>listDir</code>、<code>exec</code>、<code>cleanup</code> 等方法），默认实现是本地的 <code>NodeExecutionEnv</code>。pi-env 让 Agent 留在本地，而把“手和脚”放到另一台机器上：</p>
+<ul>
+<li><strong>本地</strong>：<code>RemoteExecutionEnv</code>（TS）实现同一个 <code>ExecutionEnv</code> 接口，通过 <code>Connection</code> 收发帧。</li>
+<li><strong>远端</strong>：Rust 守护进程 <code>pi-env serve --token &lt;hex&gt;</code>，经 <code>ssh</code> 启动，用 stdin/stdout 通信。</li>
+<li>README 的承诺：结果与“在远端机器上跑 <code>NodeExecutionEnv</code>”一致，<strong>只有错误消息文本可能不同</strong>。支持 Linux、macOS、Android（Termux）、Windows 的 x86-64 与 arm64，各平台守护进程预编译在 <code>bin/</code> 中随包发布。</li>
+</ul>
+<pre class="mermaid">
+flowchart TB
+  subgraph L["本地（Agent 所在机器）"]
+    D["Durable worker<br/>工具调用"] --> R["RemoteExecutionEnv<br/>remote-env.ts"]
+    R --> C["Connection<br/>connection.ts"]
+    S["ssh.ts<br/>探测 / 部署 / 启动命令"] -.每次启动生成命令.-> C
+    R --> W["RemoteWatcher<br/>watch.ts"]
+    T["RemoteTerminal<br/>terminal.ts"] --> C
+    W --> C
+  end
+  C == "ssh -T stdin/stdout<br/>二进制帧" ==> M
+  subgraph RM["远端"]
+    M["main.rs<br/>读帧 / 分发 / ping"] --> F["fs: 16 个 worker 线程"]
+    M --> E["exec.rs + window.rs"]
+    M --> P["pty.rs"]
+    M --> WA["watch.rs"]
+    M --> SC["scan.rs"]
+    E --> SYS["sys/unix.rs | sys/windows.rs"]
+    P --> SYS
+    M --> O["output.rs<br/>控制 / 批量 队列"]
+  end
+</pre>
+<p>分工原则写在 <code>docs/semantics.md</code>：客户端负责路径解析、abort 检查点、错误映射（<code>toFileError</code>）、readFile 的尺寸与解码、writeFile 按 512 KiB 分块、行读取器、超时与结果优先级；守护进程负责系统调用、进程、溢出文件（spill）、行扫描、从 <code>NodeFileWatcher</code> 移植的监视器，以及用 <code>encoding_rs</code> 解码输出。换言之：<strong>能在本地算的语义都留在 TS，必须贴近文件的才放 Rust</strong>。</p>
+</section>
+
+<section id="protocol">
+<h2>2. 线协议：同步行 + 二进制帧</h2>
+<h3>2.1 先同步：<code>PI-ENV &lt;token&gt;</code></h3>
+<p>ssh 登录后 shell 的 rc 文件可能往 stdout 打印横幅、motd 之类的“噪声”。所以守护进程第一件事是输出一行 <code>PI-ENV &lt;token&gt;\n</code>，客户端丢弃这行之前的一切（<code>docs/protocol.md</code>）。token 由客户端每次启动随机生成（<code>randomBytes(16)</code> 的 hex），因此噪声里不可能恰好出现它；<code>connection.ts</code> 在找同步标记时若噪声超过 1 MiB 就放弃。</p>
+<h3>2.2 帧格式</h3>
+<table class="frame-table"><thead><tr><th>字节偏移</th><th>字段</th><th>类型</th><th>说明</th></tr></thead><tbody>
+<tr><td>0</td><td><code>length</code></td><td>u32 BE</td><td>后续字节数（type 起算），范围 9..=16 MiB</td></tr>
+<tr><td>4</td><td><code>type</code></td><td>u8</td><td>1 request · 2 result · 3 error · 4 event · 5 cancel · 6 ping</td></tr>
+<tr><td>5</td><td><code>id</code></td><td>u32 BE</td><td>请求 id，用于多路复用</td></tr>
+<tr><td>9</td><td><code>jsonLength</code></td><td>u32 BE</td><td>JSON 段长度，0 表示 <code>{}</code></td></tr>
+<tr><td>13</td><td><code>json</code></td><td>UTF-8</td><td>操作参数 / 结果元数据</td></tr>
+<tr><td>13+jsonLength</td><td><code>payload</code></td><td>bytes</td><td>其余字节：文件内容、命令输出等</td></tr>
+</tbody></table>
+
+<p>所有整数大端，单帧最大 16 MiB。类型：<code>1 request</code>、<code>2 result</code>、<code>3 error</code>、<code>4 event</code>、<code>5 cancel</code>（可带 <code>{mode:"kill"}</code>）、<code>6 ping</code>。JSON 放元数据，payload 放文件内容/命令输出等二进制，<strong>避免了 base64 膨胀</strong>。守护进程的解析非常保守：</p>
+<pre><code class="language-rust">// daemon/src/frame.rs
+pub fn read_frame(input: &amp;mut impl Read) -&gt; io::Result&lt;Option&lt;Frame&gt;&gt; {
+    let mut length = [0u8; 4];
+    …
+    let length = u32::from_be_bytes(length) as usize;
+    if !(9..=MAX_FRAME).contains(&amp;length) {
+        return Err(invalid("frame length out of range"));
+    }
+    …
+    // Unparseable JSON leaves the framing intact: the frame arrives with `Value::Null` and gets an error reply.</code></pre>
+<p>注意两类错误的区别：长度越界说明字节流已错位，只能断开会话；JSON 解析失败时帧边界依然可信，所以只回一个 <code>EINVAL</code> 错误，连接继续可用。客户端同理，遇到损坏的帧会拆掉整个会话。另外 <code>MAX_PAYLOAD = MAX_FRAME - 64 KiB</code>，给 JSON 头留出余量。</p>
+<h3>2.3 多路复用与取消</h3>
+<p>每个请求带一个 <code>id</code>，<code>result</code>/<code>error</code>/<code>event</code> 用同一 id 回传，于是一条管道上可以并发几十个请求，流式输出就是同 id 的一串 <code>event</code> 帧。协议文档强调了一个容易出错的竞态：<strong>每个请求在开始执行前就先登记</strong>，因此紧跟其后的 <code>cancel</code> 不会丢（<code>test/remote.test.ts</code> 里有 “aborts commands cancelled right after they are sent”）。</p>
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Connection (TS)
+  participant D as pi-env 守护进程
+  C->>D: request id=7 exec {command, timeoutMs, window}
+  D-->>C: event id=7 {kind:"output", stream:"stdout"} + payload
+  D-->>C: event id=7 {kind:"output", stream:"stderr", skipped?} + payload
+  C->>D: request id=8 lstat {path}
+  D-->>C: result id=8 {...}
+  Note over C,D: 控制帧插队，不被 7 号的大量输出堵住
+  C->>D: cancel id=7 (abort) / {mode:"kill"} (cleanup)
+  D-->>C: error id=7 {code:"aborted"} 或 result {exitCode:137}
+  C->>D: ping (每 5 s)
+  D-->>C: ping (每 5 s)
+</pre>
+<h3>2.4 输出调度：控制队列 vs 批量队列</h3>
+<p><code>daemon/src/output.rs</code> 只有一个 stdout 写线程，但有两个队列。控制帧（小结果、错误、ping）优先；负载超过 64 KiB 的回复和 exec 结果排在输出后面（保证“结果晚于它的输出”）。未开窗口的命令输出在未发送数据超过 4 MiB 时阻塞生产者：</p>
+<pre><code class="language-rust">// daemon/src/output.rs
+pub fn wait_for_room(&amp;self, stop: &amp;AtomicBool) {
+    let mut queues = self.queues.lock().unwrap();
+    while queues.bulk_bytes &gt; BULK_LIMIT &amp;&amp; !queues.closed &amp;&amp; !stop.load(Ordering::SeqCst) {
+        queues = self
+            .drained
+            .wait_timeout(queues, Duration::from_millis(100))
+            .unwrap()
+            .0;
+    }
+}</code></pre>
+<p>这就是背压：慢网络下 <code>yes</code> 这种命令不会把守护进程内存撑爆，而 ping 依旧能及时发出，不会被误判为失联。</p>
+<h3>2.5 调度与存活</h3>
+<div class="grid2">
+  <div class="card"><h4>线程模型</h4>文件操作在 16 个 worker 线程上；exec、pty、watch 各自独占线程（16 MiB 栈）。<code>ptyWrite</code>/<code>ptyResize</code>/<code>ptyForeground</code> 由读帧线程按到达顺序直接应答，键盘输入不会乱序。</div>
+  <div class="card"><h4>有序分块写</h4><code>run_in_order</code> 让同一句柄的 <code>writeChunk</code> 串行执行；某块失败后句柄被“毒化”，后续块一律 <code>EBADF</code>，文件不会出现空洞。</div>
+  <div class="card"><h4>心跳</h4>双方每 5 s ping。守护进程 30 s 没收到任何字节（<code>Seen</code> 包装 stdin 记录最后时间）或 stdin 结束，就杀掉所有进程组并退出——ssh 断开后不会留下孤儿进程。</div>
+  <div class="card"><h4>会话</h4>客户端把在途请求失败为 <code>{code:"unknown", lost:true}</code>，下一次请求时重启。句柄绑定打开它的会话 id，旧句柄绝不会打到新守护进程上。</div>
+</div>
+</section>
+
+<section id="daemon">
+<h2>3. 守护进程各模块</h2>
+<h3>3.1 exec.rs：命令执行</h3>
+<p>每个管道一个读线程，通过 channel 把 <code>Data/Eof/Exit/WaitFailed/Cancel/Kill</code> 消息送到事件循环；事件循环负责截止时间、进程退出后 100 ms 的 stdio 宽限（<code>EXIT_STDIO_GRACE</code>，防止后台孙进程拿着管道让命令永不结束）、窗口节流以及 spill 文件。结果优先级被写成直白的代码：</p>
+<pre><code class="language-rust">// daemon/src/exec.rs
+if timed_out {
+    return Err(with_spill(Failure::new("timeout", "timeout")));
+}
+if aborted {
+    return Err(with_spill(Failure::new("aborted", "aborted")));
+}
+if let Some(error) = spill.as_ref().and_then(|spill| spill.failed.clone()) {
+    return Err(Failure::new(
+        "unknown",
+        format!("Failed to preserve complete shell output: {error}"),
+    ));
+}</code></pre>
+<p>即 <strong>timeout &gt; aborted &gt; spill 失败 &gt; 退出状态</strong>，与 <code>NodeExecutionEnv</code> 相同。字符串命令按 <code>/bin/bash</code> → <code>which bash</code> → <code>sh</code> 的顺序找 shell 并 <code>-c</code> 执行；每个命令新开一个 session，杀进程时对整个进程组发 SIGKILL；被信号杀死的退出码为 128+信号（<code>cleanup</code> 后即 137）。</p>
+<h3>3.2 window.rs：只传“窗口”里的输出</h3>
+<p>Agent 往往只关心命令输出的尾部。<code>Window {maxBytes, maxLines, minIntervalMs, bytesPerSecond}</code> 让守护进程只发送调用方会保留的那部分，被跳过的部分以 <code>skipped</code> 计数随 event 送达（客户端放进 <code>ShellOutputInfo.skipped</code>）。完整输出可选择写入远端的 <code>pi-output-&lt;uuid&gt;.log</code>（spill）。测试 “transfers only about a window of output a caller keeps, with exact counts” 校验了计数精确。</p>
+<h3>3.3 decode.rs：解码细节</h3>
+<p><code>StreamDecoder</code> 用 <code>UTF_8.new_decoder_with_bom_removal()</code>——只去掉 UTF-8 BOM，从不嗅探 UTF-16；<code>range_decoder</code>（读取文件中间某个范围）则完全不处理 BOM。这对应 Durable 里同名的 <code>StreamDecoder</code>/<code>rangeDecoder</code>，解码放在离数据最近的地方，分块边界上被切开的多字节字符也不会出错。</p>
+<h3>3.4 pty.rs：伪终端</h3>
+<p><code>openpty</code> 后在 <code>pre_exec</code> 里 <code>setsid</code> + <code>TIOCSCTTY</code> 设置控制终端，重置信号处理并清空信号掩码；<code>TIOCSWINSZ</code> 调整窗口；<code>ptyForeground</code> 用 <code>tcgetpgrp</code> 报告前台作业（测试 “reports the job in the foreground, not the shell at its prompt”）。终端传原始字节而非解码文本。Windows 暂不支持终端。</p>
+<h3>3.5 watch.rs：监视文件变化</h3>
+<p>移植自 Durable 的 <code>NodeFileWatcher</code>：基于 <code>notify</code> crate 的原生事件<strong>只用来触发防抖（50 ms）后的重新扫描</strong>，而不是直接相信事件内容；macOS FSEvents 额外等待 500 ms 稳定。对于 NFS/SMB/CIFS/FUSE/9P 这类不报告远端修改的文件系统（通过 <code>statfs</code> 魔数识别）以及 Windows，改为每 2000 ms 轮询快照。单个监视器最多 10,000 个目录；最近 5 s 内修改且 ≤256 KiB 的文件还会比较内容哈希，以发现 mtime 精度不足时的修改。</p>
+<pre><code class="language-rust">// daemon/src/watch.rs
+const UNRELIABLE_FILE_SYSTEMS: [u64; 12] = [
+    0x6969,     // NFS
+    0x517b,     // SMB
+    0xff534d42, // CIFS
+    0xfe534d42, // SMB2
+    …</code></pre>
+<p>客户端 <code>watch.ts</code> 在连接丢失后按 1 s 起、翻倍到 30 s 的退避重开监视，并上报 <code>overflow</code>——明确告诉上层“中间的变化没看到，请全量重扫”，而不是假装什么都没发生。</p>
+<h3>3.6 scan.rs 与 sys/*</h3>
+<p><code>scan.rs</code> 是 Durable <code>LineScanner</code> 的移植，按 64 KiB 块在远端扫描行，避免把整个大文件拉回本地。<code>sys/unix.rs</code> 的杀进程树非常简洁：</p>
+<pre><code class="language-rust">// daemon/src/sys/unix.rs
+pub fn kill_tree(pid: u32) {
+    let pid = pid as i32;
+    // SAFETY: plain signal delivery.
+    unsafe {
+        if libc::kill(-pid, libc::SIGKILL) != 0 {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}</code></pre>
+<p>Windows 版见第 7 节。构建方面，<code>Cargo.toml</code> 精确锁定依赖版本（<code>encoding_rs 0.8.42</code>、<code>notify 8.2.0</code> 等），release 配置开 <code>lto</code>、<code>codegen-units=1</code>、<code>strip</code>，以减小要上传的二进制。</p>
+</section>
+
+<section id="client">
+<h2>4. TS 客户端</h2>
+<h3>4.1 connection.ts：懒启动、会话与重试</h3>
+<ul>
+<li>启动命令可以是静态数组，也可以是<strong>每次启动都重新执行的 async 函数</strong>——SSH 部署逻辑正是挂在这里。</li>
+<li><code>#connect</code> 不缓存失败的启动：一次失败只让等待这次启动的请求失败，下一次请求重新尝试（测试 “computes the command at each start and retries a start that failed”）。</li>
+<li><code>request(op, json, {session})</code> 若会话已变则直接以 lost 失败；<code>kill()</code> 发送带 <code>mode:"kill"</code> 的 CANCEL。</li>
+<li>接收端是分块缓冲区（peek/consume），payload 拷贝成普通 <code>Uint8Array</code>，字符串用 <code>toWellFormed()</code> 规整孤立代理项，保证 JSON 能被 Rust 端的 serde 接受。</li>
+</ul>
+<h3>4.2 remote-env.ts：在本地复刻 Node 语义</h3>
+<p>路径解析完全在本地完成，但用的是<strong>远端</strong>的 home、分隔符和工作目录（来自 hello 回复，缓存在 <code>connection.info()</code>），连 Windows 的“驱动器相对路径”都照 Node 的规则处理：</p>
+<pre><code class="language-ts">// src/remote-env.ts — #resolve
+if (windows) {
+  // A drive-relative path on another drive: Node on Windows resolves it against that drive's working directory
+  // (`=D:`), else its own working directory if on that drive, else the drive's root.
+  const drive = /^([a-zA-Z]:)(?![\\/])/.exec(normalized)?.[1];
+  if (drive !== undefined &amp;&amp; drive.toLowerCase() !== this.cwd.slice(0, 2).toLowerCase()) {
+    let base = info.driveCwds[drive.toUpperCase()] ?? info.cwd;
+    …</code></pre>
+<p>写文件采用流水线：第一块 512 KiB 随 <code>write</code> 请求发出，若还有剩余则 <code>keep</code> 句柄，之后最多 8 个 <code>writeChunk</code> 在途（<code>WRITE_DEPTH = 8</code>）。由于守护进程按序执行且失败即毒化句柄，“并发发送”与“顺序语义”得以兼得：</p>
+<pre><code class="language-ts">// src/remote-env.ts — #write
+const written = handle.request("writeChunk", {}, { payload: bytes.subarray(offset, offset + WRITE_CHUNK) });
+written.catch(() =&gt; {});
+inFlight.push(written);
+if (inFlight.length &gt;= WRITE_DEPTH) await inFlight.shift();
+…
+// The first failure; later chunks are refused by the daemon, so the file has no gaps.
+for (const written of inFlight) await written;</code></pre>
+<p><code>exec</code> 把 <code>onOutput</code> 回调抛出的异常转换成 <code>callback_error</code> 并取消远端命令；<code>cleanup()</code> 对在途命令用 kill 而非 abort，“so the commands settle with their killed status, as <code>NodeExecutionEnv</code> does”。</p>
+<h3>4.3 错误映射：只有 code 是契约</h3>
+<pre><code class="language-ts">// src/errors.ts — toFileError（节选）
+case "ENOENT":
+  return new FileError("not_found", error.message, path, error);
+case "EACCES":
+case "EPERM":
+  return new FileError("permission_denied", error.message, path, error);
+…
+case "EINVAL":
+case "SYMLINK":
+case "NOT_REGULAR":
+  return new FileError("invalid", error.message, path, error);</code></pre>
+<p>守护进程回传 Node 风格的 errno 名（或 <code>shell_unavailable</code>/<code>spawn_error</code>/<code>timeout</code>/<code>aborted</code>/<code>unknown</code>），客户端用与 <code>NodeExecutionEnv</code> 完全相同的表映射成 <code>FileError</code>。协议文档明言：只有 code 属于契约，message 不是。</p>
+<h3>4.4 terminal.ts</h3>
+<p><code>openTerminal(connection, options)</code> 返回 <code>RemoteTerminal</code>：输入按块走 <code>ptyWrite</code>，<code>resize</code> 走 <code>ptyResize</code>，<code>foreground()</code> 带会话 id 请求 <code>ptyForeground</code>；程序退出、<code>close()</code> 或连接丢失（守护进程会杀掉它）时终端结束。<code>localDaemon()</code> 还能让本地会话也用守护进程提供终端。</p>
+</section>
+
+<section id="ssh">
+<h2>5. ssh.ts：探测、部署、主机密钥</h2>
+<h3>5.1 连接时序</h3>
+<pre class="mermaid">
+sequenceDiagram
+  participant A as Agent
+  participant C as Connection
+  participant S as ssh.ts
+  participant H as 远端 sshd / shell
+  participant D as pi-env 守护进程
+  A->>C: 第一次 request（懒启动）
+  C->>S: command()（每次启动都执行）
+  alt 首次：尚未探测
+    S->>H: POSIX_PROBE（uname / HOME / TMPDIR / LD_PRELOAD）
+    H-->>S: PI-ENV-PROBE ...（失败则改用 PowerShell 探测）
+  end
+  S->>H: checkDaemon：远端算 sha256
+  alt missing
+    S->>H: 上传到临时文件 → 校验哈希 → mv 到 ~/.pi/mobile/tools/pi-env-sha前缀
+  end
+  S-->>C: ssh 参数 + 启动命令
+  C->>H: ssh ... 'pi-env' serve --token hex
+  H->>D: 启动
+  D-->>C: rc 噪声 ... PI-ENV token
+  C->>D: request hello
+  D-->>C: result {protocol, os, arch, home, separator, cwd, driveCwds...}
+  C->>D: 真正的请求
+</pre>
+<h3>5.2 按内容寻址的部署</h3>
+<pre><code class="language-ts">// src/ssh.ts
+/** Where a daemon with this content lives on the remote machine: named by its SHA-256, so versions never collide. */
+function daemonPath(remote: RemotePlatform, sha256: string): string {
+  const name = `pi-env-${sha256.slice(0, 32)}`;
+  return remote.platform === "windows"
+    ? `${remote.home}\\.pi\\mobile\\tools\\${name}.exe`
+    : `${remote.home}/.pi/mobile/tools/${name}`;
+}</code></pre>
+<p>POSIX 上传脚本的关键几行：</p>
+<pre><code class="language-ts">// src/ssh.ts — deployDaemon
+'t=$(mktemp "$d/.pi-env.XXXXXX")',
+'cat &gt; "$t"',
+`if [ "$(hash "$t")" != ${sha256} ]; then rm -f "$t"; echo "pi-env upload is corrupt" &gt;&amp;2; exit 1; fi`,
+'chmod 700 "$t"',
+'mv -f "$t" "$f"',
+// Older daemons; running ones keep their file open until they exit.
+'for old in "$d"/pi-env-*; do [ "$old" = "$f" ] || rm -f "$old"; done',</code></pre>
+<ul>
+<li>哈希工具依次尝试 <code>sha256sum</code>、<code>shasum -a 256</code>、<code>openssl dgst</code>；都没有就拒绝（<code>nohash</code>）而不是“盲跑”。</li>
+<li>先写临时文件、校验通过再原子 <code>mv</code>，所以目标路径上永远只会是完整且正确的二进制。</li>
+<li><strong>每次启动前都重新校验</strong>：<code>sshConnectionFor</code> 的 command 函数只有在 <code>connectSsh</code> 刚刚验证过的第一次启动才跳过 <code>deployDaemon</code>。测试 “verifies the daemon again before starting it after a lost connection”、“reuses a verified daemon and replaces a tampered one”覆盖了这点。</li>
+<li>Windows 上 PowerShell 以文本行读取重定向的 stdin，且 Windows sshd 可能不传递 stdin 结束，所以二进制以 76 字符的 base64 行发送，以 <code>PI-ENV-END</code> 结尾；<code>Move-Item</code> 失败会重试 20 次（被运行中的守护进程或杀毒软件占用）。</li>
+</ul>
+<h3>5.3 两种入口与主机密钥流程</h3>
+<div class="grid2">
+  <div class="card"><h4><code>sshConnection()</code>：懒</h4>首个请求才连接。失败（断网、主机密钥不受信或已变）让等待中的请求以 <code>spawn_error</code> 失败，消息是 ssh 的诊断输出；下一个请求重试。</div>
+  <div class="card"><h4><code>connectSsh()</code>：急</h4>立即探测并部署，失败直接 reject；主机密钥必须已经受信，否则抛 <code>HostKeyUnknownError</code>。</div>
+</div>
+<p>信任主机密钥是显式的三步：<code>scanHostKey</code> 用 <code>accept-new</code> 连到一个<strong>临时</strong> known_hosts 文件拿到密钥行，并用 <code>ssh-keygen -lf</code> 算指纹给用户确认 → <code>acceptHostKey</code> 写入目标的 known_hosts → 之后所有连接都用 <code>StrictHostKeyChecking=yes</code>。<code>acceptHostKey</code> 只接受“别名 类型 密钥”的纯文本行（拒绝标记、通配符、哈希主机名），同类型密钥不同则抛 <code>HostKeyChangedError</code>——必须先 <code>forgetHostKey</code>，绝不静默替换。known_hosts 的修改按文件串行，并通过“临时文件 + rename”原子完成。</p>
+</section>
+
+<section id="hardening">
+<h2>6. SSH 加固清单</h2>
+<p><code>sshArguments</code> 生成的参数几乎把所有可能“意外放大权限”的 ssh 特性都关了：</p>
+<div class="grid2">
+  <div class="card"><h4>不转发任何东西</h4><code>-T -a -x</code>，<code>ClearAllForwardings</code>，<code>ForwardAgent=no</code>，<code>ForwardX11=no</code>：远端拿不到你的 ssh-agent 或 X 显示。</div>
+  <div class="card"><h4>不被用户配置劫持</h4><code>ControlMaster=no</code>/<code>ControlPath=none</code>，<code>RemoteCommand=none</code>，<code>PermitLocalCommand=no</code>，<code>SendEnv=-*</code>；可选的 <code>configFile</code> 路径会加引号并转义 <code>%</code>。</div>
+  <div class="card"><h4>严格的主机身份</h4><code>BatchMode=yes</code>（永不交互提示），<code>StrictHostKeyChecking=yes</code>，独立 <code>UserKnownHostsFile</code>、<code>GlobalKnownHostsFile=none</code>、<code>HashKnownHosts=no</code>、<code>HostKeyAlias</code>，<code>IdentitiesOnly</code>。</div>
+  <div class="card"><h4>参数注入防护</h4><code>checkField</code> 拒绝以 <code>-</code> 开头或含空白的 host/user 等字段，并在 host 前放 <code>--</code>；另有 <code>ServerAliveInterval=15</code>，SSH 超时 60 s、上传 300 s。</div>
+</div>
+<div class="callout warn">守护进程默认不经登录 shell 启动（<code>ssh</code> 本身就不用登录 shell）；需要 <code>~/.profile</code> 里的环境时设置 <code>loginShell: true</code>，启动命令变为 <code>exec "$SHELL" -lc 'exec "$0" "$@"' &lt;daemon&gt;</code>，参数通过 <code>$0</code>/<code>"$@"</code> 传递，避免二次拼接引号。</div>
+</section>
+
+<section id="windows">
+<h2>7. Windows 与 Termux 细节</h2>
+<ul>
+<li><strong>平台探测</strong>：先发 POSIX 探测，失败（远端 shell 是 cmd/PowerShell）再用 <code>powershell -NoProfile -NonInteractive -EncodedCommand</code>（UTF-16LE base64，免去引号地狱）；若 uname 返回 MINGW/MSYS/CYGWIN（Git Bash 是默认 shell），仍改问 PowerShell 获取真实架构和 home。最后用 <code>echo %OS%</code> 是否展开来区分 cmd 与 PowerShell，决定启动命令写成 <code>&amp; 'path'</code> 还是带引号路径。</li>
+<li><strong>进程</strong>（<code>daemon/src/sys/windows.rs</code>，遵循 libuv）：所有子进程放进 job object（<code>KILL_ON_JOB_CLOSE</code>、<code>BREAKAWAY_OK</code>、<code>DIE_ON_UNHANDLED_EXCEPTION</code>），守护进程退出即全部清理；<code>kill_tree</code> 调 <code>taskkill /F /T /PID</code>；读线程用 <code>CancelSynchronousIo</code> 打断；<code>CREATE_NO_WINDOW</code>。</li>
+<li><strong>命令</strong>：字符串命令走 Git Bash（配置的 shell → Git Bash → <code>where bash.exe</code>），会识别旧版 WSL bash 并改用 stdin 传命令；argv 命令按 libuv 的 <code>search_path</code> 直接解析，并像 Node 一样<strong>拒绝 .bat/.cmd</strong>（无 shell 时批处理参数转义不安全）；参数按 libuv 的 <code>quote_cmd_arg</code> 拼接。</li>
+<li><strong>监视</strong>：Windows 一律轮询。</li>
+<li><strong>Termux</strong>：<code>tmpdir</code> 用 <code>$PREFIX/tmp</code>；探测会警告未设置 <code>TMPDIR</code>、未加载 <code>termux-exec</code>（<code>#!/usr/bin/env</code> 脚本会失败），并提示用 <code>termux-wake-lock</code> 防止 Android 挂起。</li>
+</ul>
+</section>
+
+<section id="parity">
+<h2>8. 语义对齐与测试</h2>
+<p><code>docs/semantics.md</code> 以 <code>packages/durable/src/env/node.ts</code> 为参照，逐条列出 mkdir、rm（目录返回 <code>ERR_FS_EISDIR</code>）、mkdtemp、tmpdir、listDir 按字节序排序、openBinaryReader 等规则。如何保证不跑偏？两层测试，都直接跑真实的守护进程二进制（<code>test/daemon.ts</code>：CI 用 <code>PI_ENV_DAEMON</code> 指向 release 构建）：</p>
+<div class="grid2">
+  <div class="card"><h4>一致性测试</h4><code>test/conformance.test.ts</code> 调用 Durable 导出的 <code>registerEnvConformance</code>——也就是 <code>NodeExecutionEnv</code> 本身要通过的那套测试——对“经管道连接的 RemoteExecutionEnv”再跑一遍。</div>
+  <div class="card"><h4>差分随机测试</h4><code>test/differential.test.ts</code> 对 60 个种子各生成 25 步随机文件操作，同时作用于本地 <code>NodeExecutionEnv</code> 与 <code>RemoteExecutionEnv</code> 的两个临时目录，归一化后要求完全相等。</div>
+</div>
+<pre><code class="language-ts">// test/differential.test.ts
+it("gives the same results for random file operation sequences", async () =&gt; {
+  for (let seed = 1; seed &lt;= 60; seed++) {
+    const next = random(seed);
+    …
+    for (let step = 0; step &lt; 25; step++) {
+      …
+      expect(actual, `seed ${seed} step ${step} ${operation.label}`).toEqual(expected);</code></pre>
+<p>归一化只保留失败的 <strong>error code</strong>（与“只有 code 是契约”呼应），替换根目录、抹掉 mtime。测试内容专挑边界：空文件、带 BOM 与 CRLF 的文本、非法 UTF-8 字节、70,000 字节（跨读块）、<code>"é".repeat(300_001)</code>（跨写块且把多字节字符切在块边界）。路径集合里还有 <code>a.txt/x</code> 这种“把文件当目录”的情况，用来对比 <code>ENOTDIR</code>。此外还有 read/bash 工具级别的对比，以及 <code>ssh.test.ts</code>（本地起 sshd 测主机密钥、篡改替换、登录 shell、懒连接）、<code>terminal.test.ts</code>、<code>remote.test.ts</code>（窗口计数、立即取消、超时、跨会话句柄）。</p>
+</section>
+
+<section id="takeaways">
+<h2>9. 值得借鉴的设计</h2>
+<ol>
+<li><strong>语义放客户端，系统调用放守护进程。</strong>守护进程保持“薄”，Node 的路径/错误/结果规则在 TS 里只实现一次，再用一致性测试 + 差分随机测试锁死行为。</li>
+<li><strong>二进制帧 + 双队列背压。</strong>JSON 头 + 原始 payload 免 base64；控制帧插队、批量输出 4 MiB 上限，保证大量输出时心跳与取消依然及时；“先登记再执行”消除取消竞态。</li>
+<li><strong>按内容寻址、每次启动前校验。</strong>以 SHA-256 命名、临时文件校验后原子替换，多版本共存不冲突，被篡改的二进制会被发现并替换。</li>
+<li><strong>失败是一等公民。</strong>懒连接 + 不缓存失败的启动、会话绑定的句柄、lost 标记、watch 的 overflow、30 s 无声自杀并杀进程组——每一种断线都有明确、可观察的结果。</li>
+</ol>
+<p class="muted">来源：packages/env 下的 README.md、docs/protocol.md、docs/semantics.md、daemon/src/*.rs、daemon/Cargo.toml、src/*.ts、test/*.ts，以及 packages/durable/src/env/index.ts，提交 6db4070f。</p>
+</section>
