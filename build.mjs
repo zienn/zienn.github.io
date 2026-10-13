@@ -76,15 +76,14 @@ const ICON = {
 function layout({ title, rel, body, desc = cfg.subtitle, path: here = "", active = "" }) {
   const nav = (key, href, label) => `<a href="${rel}${href}"${active === key ? ' aria-current="page"' : ""}>${label}</a>`;
   return `<!DOCTYPE html>
-<html lang="${cfg.lang}" data-theme="dark">
+<html lang="${cfg.lang}" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <meta name="description" content="${esc(desc)}">
 <meta name="color-scheme" content="dark light">
-<script>(function(){var q=new URLSearchParams(location.search).get("theme");if(q==="light"||q==="dark")localStorage.setItem("theme",q);var t=localStorage.getItem("theme")||"dark";document.documentElement.dataset.theme=t;})();</script>
-<link rel="preload" href="${rel}assets/fonts/ibm-plex-mono-latin-500-normal.woff2" as="font" type="font/woff2" crossorigin>
+<script>(function(){var q=new URLSearchParams(location.search).get("theme");if(q==="light"||q==="dark")localStorage.setItem("theme",q);var t=localStorage.getItem("theme")||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");document.documentElement.dataset.theme=t;})();</script>
 <link rel="stylesheet" href="${rel}assets/style.css">
 </head>
 <body>

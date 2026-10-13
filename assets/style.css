@@ -4,12 +4,6 @@
    正文列保持安静：IBM Plex Sans + 系统中文黑体，等宽只用于代码、元数据和标签。
    ===================================================================== */
 
-@font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:400;font-display:swap;src:url(fonts/ibm-plex-sans-latin-400-normal.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
-@font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:600;font-display:swap;src:url(fonts/ibm-plex-sans-latin-600-normal.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
-@font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:700;font-display:swap;src:url(fonts/ibm-plex-sans-latin-700-normal.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
-@font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:400;font-display:swap;src:url(fonts/ibm-plex-mono-latin-400-normal.woff2) format("woff2")}
-@font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:500;font-display:swap;src:url(fonts/ibm-plex-mono-latin-500-normal.woff2) format("woff2")}
-@font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:600;font-display:swap;src:url(fonts/ibm-plex-mono-latin-600-normal.woff2) format("woff2")}
 
 /* ---------- tokens ---------- */
 :root{
@@ -286,3 +280,119 @@ ol.refs li{word-break:break-word}
   .toc-inline ol ol{padding-left:14px}
   .toc-inline a{display:block;padding:4px 0;color:var(--muted);text-decoration:none}
 }
+
+/* =====================================================================
+   Restyle layer — 复刻 keyu-tian-sabotage.github.io 的视觉系统：
+   衬线正文（Iowan Old Style / Palatino / 宋体）+ 系统无衬线小号大写标签 + 系统等宽代码；
+   暖白 / 暖黑纸面，砖红强调色，细分隔线，660px 单栏正文。只用系统字体，无 webfont。
+   ===================================================================== */
+:root{
+  --serif:"Iowan Old Style","Iowan Old Style BT","Palatino Linotype",Palatino,Georgia,"Songti SC","Noto Serif CJK SC","Source Han Serif SC","SimSun",serif;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",Arial,sans-serif;
+  --mono:"SF Mono",SFMono-Regular,ui-monospace,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+  --measure:660px; --wide:760px; --radius:4px;
+}
+[data-theme="light"]{
+  color-scheme:light;
+  --bg:#ffffff; --fg:#282828; --text:#282828; --muted:#6b6866; --faint:#6b6866;
+  --rule:#e4e2de; --line:#e4e2de; --line-strong:#d3d0cb;
+  --surface:#f3f3f2; --raised:#ffffff; --code-bg:#f3f3f2; --code-fg:#3d3936;
+  --accent:#9c2b17; --accent-ink:#ffffff; --accent-soft:#fbefeb; --accent-line:#e8c3b8; --mark:#fbe9c8; --tint:#fbefeb;
+  --ok:#3f6b3a; --warn:#9a5800; --danger:#b42318; --info:#566173;
+  --shadow:0 8px 24px -12px rgba(40,40,40,.18);
+  --t-kw:#9c2b17; --t-str:#5a6b2f; --t-num:#9a5800; --t-fn:#3d3936; --t-type:#566173; --t-com:#8e8a85; --t-attr:#7a4a2a;
+}
+[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#151514; --fg:#e4e1da; --text:#e4e1da; --muted:#9c978e; --faint:#9c978e;
+  --rule:#302f2c; --line:#302f2c; --line-strong:#43413d;
+  --surface:#1f1e1c; --raised:#1f1e1c; --code-bg:#1f1e1c; --code-fg:#d6d2ca;
+  --accent:#e9957d; --accent-ink:#151514; --accent-soft:#33201b; --accent-line:#6b3a2e; --mark:#4a3a17; --tint:#33201b;
+  --ok:#a9c49a; --warn:#e6b877; --danger:#f0a699; --info:#aab2c0;
+  --shadow:0 8px 24px -12px rgba(0,0,0,.6);
+  --t-kw:#e9957d; --t-str:#b9c48f; --t-num:#e6b877; --t-fn:#d6d2ca; --t-type:#aab2c0; --t-com:#7d7972; --t-attr:#d9b08c;
+}
+body{font-family:var(--serif);font-size:17px;line-height:1.85;letter-spacing:0!important;-webkit-font-smoothing:auto}
+::selection{background:var(--mark);color:var(--fg)}
+a{color:inherit;text-decoration-color:var(--muted);text-underline-offset:3px}
+a:hover{color:var(--accent);text-decoration-color:currentColor}
+/* masthead：像参考站的 .bar —— 小号大写无衬线，细边按钮 */
+.masthead{background:var(--bg)!important;border-bottom:0!important;backdrop-filter:none!important;box-shadow:none!important}
+.masthead-inner{max-width:992px;padding-block:18px}
+.mark{font-family:var(--sans);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)!important;text-decoration:none}
+.mark-path,.caret{display:none!important}
+.mark-name{color:var(--muted)}
+.sitenav a{font-family:var(--sans);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.sitenav a:hover,.sitenav a[aria-current="page"]{color:var(--fg)}
+.sitenav a[aria-current="page"]::before{display:none}
+.search-field,.icon-btn{border:1px solid var(--rule)!important;border-radius:999px!important;background:transparent!important;font-family:var(--sans);min-height:36px}
+.icon-btn{color:var(--fg)}
+.icon-btn:hover{background:var(--surface)!important}
+.search-field input{font-family:var(--sans);font-size:13px}
+kbd{font-family:var(--sans);border-color:var(--rule);background:var(--surface)}
+.search-results{border:1px solid var(--rule);border-radius:6px;box-shadow:var(--shadow);background:var(--bg);font-family:var(--sans)}
+.search-results mark{background:var(--mark);color:inherit}
+/* 标签类文字：参考站的 .label / .meta */
+.list-head,.rail-head,.toc-title,.entry-date,.entry-meta,.post-meta,.tag-posts time,.site-footer,.footer-inner,pre[data-lang]::before,.badge{font-family:var(--sans)!important}
+.list-head,.rail-head,.toc-title{font-size:12px!important;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)!important;font-weight:400!important}
+.entry-date,.entry-meta,.post-meta,.tag-posts time{font-size:13px;color:var(--muted)}
+.tag{font-family:var(--sans);font-size:12.5px;border:1px solid var(--rule);border-radius:999px;background:transparent;color:var(--muted);text-decoration:none}
+.tag:hover{color:var(--accent);border-color:var(--accent-line);background:transparent}
+.entry-title a,.index-list a,.tag-posts a,.post-toc a{text-decoration:none}
+/* 标题：衬线 600 */
+h1,h2,h3,h4,.intro h1,.post-head h1,.entry-title,.post-body h2,.post-body h3,.page h1,.post-nav a{font-family:var(--serif)!important;font-weight:600!important;letter-spacing:0!important;color:var(--fg)}
+.post-head{text-align:center;margin-bottom:52px}
+.post-head h1{font-size:clamp(25px,5.2vw,31px)!important;line-height:1.38!important;text-wrap:balance}
+.post-head .lede,.lede{color:var(--muted)}
+.post-body h2{font-size:23px!important;line-height:1.4;margin:52px 0 18px}
+.post-body h3{font-size:19px!important}
+.post-body > section{border-top:0!important;padding-top:0}
+.post-body li::marker{color:var(--muted)}
+.post-body strong{font-weight:650}
+.intro h1{font-size:clamp(25px,5.2vw,31px)!important}
+.post-body h2 .anchor,.post-body h3 .anchor{color:var(--muted)}
+/* 代码 */
+code,kbd,samp{font-family:var(--mono)}
+:not(pre)>code{background:var(--surface);color:inherit;padding:2px 5px;border-radius:3px;font-size:.86em;border:0}
+pre{background:var(--surface)!important;color:var(--code-fg);border:0!important;border-radius:4px!important;line-height:1.6;box-shadow:none!important}
+pre code,pre code.hljs{font-size:13px;background:transparent!important;color:var(--code-fg)}
+pre[data-lang]::before{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);background:transparent;border:0}
+.copy-btn{font-family:var(--sans);border:1px solid var(--rule);border-radius:999px;background:var(--bg);color:var(--muted)}
+.copy-btn:hover{color:var(--fg);background:var(--surface)}
+pre.mermaid{background:transparent!important;border:1px solid var(--rule)!important}
+/* 表格、引用、提示框、卡片 */
+table{font-family:var(--sans);font-size:14px;border-collapse:collapse}
+thead th{background:transparent!important;font-weight:600;color:var(--fg);border-bottom:1px solid var(--line-strong)!important;font-size:12px;letter-spacing:.08em;text-transform:uppercase}
+th,td{border:0!important;border-bottom:1px solid var(--rule)!important}
+tbody tr:hover td{background:var(--surface)}
+blockquote{border-left:2px solid var(--accent);color:var(--muted);background:transparent;padding-left:16px}
+.callout{background:var(--surface)!important;border:0!important;border-left:3px solid var(--accent)!important;border-radius:0 4px 4px 0!important;color:var(--fg)}
+.callout.warn{border-left-color:var(--warn)!important}
+.callout.danger{border-left-color:var(--danger)!important}
+.callout.ok{border-left-color:var(--ok)!important}
+.grid2 .card,.stack div{background:var(--surface)!important;border:1px solid var(--rule)!important;border-radius:8px!important;box-shadow:none!important}
+.card h4{font-family:var(--serif);font-weight:600}
+.badge{border-radius:999px;background:var(--surface);color:var(--muted);border:1px solid var(--rule)}
+/* 首页列表：参考站 timeline 的细线行 */
+.entries{border-top:1px solid var(--rule)}
+.entry{border-bottom:1px solid var(--rule)!important;border-top:0!important;background:transparent!important}
+.entry-summary{color:var(--muted)}
+/* TOC */
+.post-toc{font-family:var(--sans);font-size:13px}
+.post-toc a{color:var(--muted);border-left-color:var(--rule)}
+.post-toc a:hover{color:var(--fg)}
+.post-toc a.active{color:var(--accent)!important;border-left-color:var(--accent)!important}
+.toc-top{font-family:var(--sans);color:var(--muted)}
+.post-nav a{border:1px solid var(--rule);border-radius:6px;background:transparent}
+.post-nav a span{font-family:var(--sans);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.post-nav a:hover{border-color:var(--accent-line)}
+ol.refs{font-size:15px}
+.site-footer{border-top:1px solid var(--rule);color:var(--muted);font-size:13px}
+@media (max-width:640px){
+  body{font-size:16px}
+  .post-head{margin-bottom:40px}
+  .post-body h2{font-size:21px!important;margin-top:44px}
+  pre code{font-size:12px}
+}
+.runninghead{display:none!important}
+.entries{border-top:0}

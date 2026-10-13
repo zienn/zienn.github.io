@@ -19,3 +19,8 @@
 - 文章目录：桌面端放在右侧，滚动时高亮当前小节；手机端折叠成正文上方的 `<details>`。
 - 只保留一个动效：刊头里闪烁的块状光标（开启 prefers-reduced-motion 时关闭）。
 - 浏览器自带的部分也按主题设置：文字选区、输入光标、滚动条、焦点环。
+
+## 2026-10-13 Restyle（替代上方琥珀色/IBM Plex 方案）
+复刻 keyu-tian-sabotage.github.io 的视觉系统：衬线正文（Iowan Old Style → Palatino → Georgia → 宋体），系统无衬线小号大写标签（12px，.12em），系统等宽代码；
+浅色 #fff/#282828/#6b6866，线 #e4e2de，面 #f3f3f2，强调 #9c2b17；深色 #151514/#e4e1da/#9c978e，线 #302f2c，面 #1f1e1c，强调 #e9957d。
+主题默认跟随系统 prefers-color-scheme。只用系统字体，不加载 webfont。实现见 assets/style.css 末尾的 Restyle layer。
