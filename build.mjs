@@ -91,20 +91,23 @@ function layout({ title, rel, body, desc = cfg.subtitle, path: here = "", active
 <header class="masthead">
   <div class="masthead-inner">
     <a class="mark" href="${rel}index.html" aria-label="${esc(cfg.title)} 首页"><span class="mark-path">~/</span><span class="mark-name">${esc(cfg.handle || "zienn")}</span><span class="caret" aria-hidden="true"></span></a>
+    <div class="controls">
     <nav class="sitenav" aria-label="主导航">
       ${nav("home", "index.html", "文章")}
       ${nav("tags", "tags/index.html", "标签")}
       ${nav("about", "about.html", "关于")}
     </nav>
-    <div class="search" role="search">
+    <button id="search-toggle" class="icon-btn" type="button" aria-label="搜索" aria-expanded="false" aria-controls="site-search">${ICON.search}</button>
+    <button id="theme-toggle" class="icon-btn" type="button" aria-label="切换深色 / 浅色">${ICON.sun}${ICON.moon}</button>
+    </div>
+  </div>
+  <div class="search" id="site-search" role="search" hidden>
       <label class="search-field">
         ${ICON.search}
         <input id="search-input" type="search" placeholder="搜索标题、标签、正文" autocomplete="off" aria-label="搜索文章">
         <kbd>/</kbd>
       </label>
       <div id="search-results" class="search-results" hidden></div>
-    </div>
-    <button id="theme-toggle" class="icon-btn" type="button" aria-label="切换深色 / 浅色">${ICON.sun}${ICON.moon}</button>
   </div>
   ${here ? `<div class="runninghead"><div class="masthead-inner"><span>${esc(here)}</span></div></div>` : ""}
 </header>
@@ -175,7 +178,7 @@ function build() {
       ${p.summary ? `<p class="lede">${esc(p.summary)}</p>` : ""}
       <div class="post-meta"><time datetime="${p.date}">${p.date}</time><span>${esc(p.category || "未分类")}</span><span>约 ${p.minutes} 分钟</span>${tagLinks(p.tags, rel)}</div>
     </header>
-    ${p.tocCount ? `<details class="toc-inline"><summary>目录</summary><nav>${p.tocHtml}</nav></details>` : ""}
+    ${p.tocCount ? `<details class="toc-inline"><summary><span class="label">目录</span></summary><nav>${p.tocHtml}</nav></details>` : ""}
     <div class="post-body">
 ${p.html}
     </div>
@@ -204,23 +207,17 @@ ${p.html}
   {
     const rel = "";
     const body = `<main class="home">
-  <section class="intro">
+  <header class="intro title">
     <h1>${esc(cfg.title)}</h1>
-    <p>${esc(cfg.subtitle)}</p>
-  </section>
+    <p class="meta">${esc(cfg.subtitle)}</p>
+  </header>
   <div class="home-grid">
     <section aria-labelledby="latest">
-      <h2 id="latest" class="list-head">全部文章</h2>
+      <h2 id="latest" class="list-head label">全部文章 · ${posts.length}</h2>
       <ol class="entries" id="post-list">
       ${posts.map((p) => postRow(p, rel)).join("\n")}
       </ol>
     </section>
-    <aside class="rail" aria-label="分类与标签">
-      <h2 class="rail-head">分类</h2>
-      <ul class="index-list">${cats.map(([c, ps]) => `<li><a href="tags/index.html#${tagId("cat:" + c)}">${esc(c)}</a><span class="count">${ps.length}</span></li>`).join("")}</ul>
-      <h2 class="rail-head">标签</h2>
-      <div class="tag-cloud">${tags.map(([t, ps]) => `<a class="tag" href="tags/index.html#${tagId(t)}">#${esc(t)}<span class="count">${ps.length}</span></a>`).join("")}</div>
-    </aside>
   </div>
 </main>`;
     fs.writeFileSync(path.join(OUT, "index.html"), layout({ title: cfg.title, rel, body, active: "home" }));

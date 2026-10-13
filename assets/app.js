@@ -133,7 +133,10 @@
     else if (e.key === "Escape") { box.hidden = true; input.blur(); }
   });
   document.addEventListener("click", function (e) { if (!e.target.closest(".search")) box.hidden = true; });
-  document.addEventListener("keydown", function (e) { if (e.key === "/" && document.activeElement !== input) { e.preventDefault(); input.focus(); } });
+  var sbox = document.getElementById("site-search"), stog = document.getElementById("search-toggle");
+  function openSearch(show) { sbox.hidden = !show; stog.setAttribute("aria-expanded", String(show)); if (show) input.focus(); else box.hidden = true; }
+  stog.addEventListener("click", function () { openSearch(sbox.hidden); });
+  document.addEventListener("keydown", function (e) { if (e.key === "/" && document.activeElement !== input) { e.preventDefault(); openSearch(true); } else if (e.key === "Escape" && !sbox.hidden && document.activeElement !== input) openSearch(false); });
   var q = new URLSearchParams(location.search).get("q");
   if (q) { input.value = q; show(q); }
 })();

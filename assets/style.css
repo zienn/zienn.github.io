@@ -396,3 +396,73 @@ ol.refs{font-size:15px}
 }
 .runninghead{display:none!important}
 .entries{border-top:0}
+
+/* =====================================================================
+   Layout layer — 复刻参考站布局：992px 顶栏 + 660px 居中单栏
+   ===================================================================== */
+body{padding-inline:max(20px,env(safe-area-inset-left)) max(20px,env(safe-area-inset-right))}
+.masthead{position:static!important}
+.masthead-inner{max-width:992px!important;margin:0 auto;padding:18px 0!important;min-height:0;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:nowrap!important}
+.masthead .controls{display:flex;align-items:center;gap:8px}
+.sitenav{display:flex;gap:4px;margin:0!important;width:auto!important;order:0!important}
+.sitenav a{padding:0 10px;min-height:36px;display:inline-flex;align-items:center;text-decoration:none}
+.icon-btn{min-width:44px;min-height:36px;display:inline-flex;align-items:center;justify-content:center;padding:0 12px}
+.search{max-width:660px;margin:0 auto 8px!important;position:relative;width:100%!important;order:0!important}
+.search[hidden]{display:none}
+.search-field{display:flex;width:100%}
+.search-results{left:0;right:0;width:auto!important}
+/* home */
+.home{max-width:660px!important;margin:0 auto;padding:28px 0 96px!important}
+.home-grid{display:block!important}
+.intro.title{text-align:center;margin:0 0 52px!important}
+.intro h1{margin:0 0 20px!important;line-height:1.38}
+.intro .meta{font-family:var(--sans);font-size:13px;line-height:1.6;color:var(--muted);margin:0}
+.list-head.label{margin:0 0 12px!important;padding:0!important;border:0!important}
+.entries{list-style:none;margin:0;padding:0;border-top:1px solid var(--rule)!important}
+.entry{display:grid!important;grid-template-columns:8.2em minmax(0,1fr)!important;gap:16px!important;padding:14px 0!important;border-bottom:1px solid var(--rule)!important}
+.entry-date{font-size:13px!important;padding-top:4px!important;font-variant-numeric:tabular-nums;color:var(--accent)!important}
+.entry-title{font-size:18px!important;line-height:1.5!important;margin:0 0 4px!important}
+.entry-summary{font-size:15px;line-height:1.65;margin:0 0 6px!important}
+.entry-meta{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+.entry-meta .tag{border:0;padding:0;border-radius:0;background:none}
+/* pages */
+.page{max-width:660px!important;margin:0 auto;padding:28px 0 96px!important}
+.page h1{text-align:center}
+/* post */
+.post-layout{display:block!important;max-width:660px!important;margin:0 auto;padding:28px 0 96px!important}
+.post{max-width:660px}
+.post-meta{justify-content:center;display:flex;flex-wrap:wrap;gap:4px 12px}
+.post-meta .tag{border:0;padding:0;background:none}
+.toc-inline{display:block!important;margin:0 0 40px!important;padding:18px 20px 10px;background:var(--surface)!important;border:0!important;border-radius:6px!important;font-family:var(--sans);font-size:14px}
+.toc-inline summary{cursor:pointer;list-style:none;padding:0!important;font-family:var(--sans)!important}
+.toc-inline summary::-webkit-details-marker{display:none}
+.toc-inline summary .label{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.toc-inline summary::after{content:"展开";float:right;font-size:12.5px;color:var(--accent)}
+.toc-inline[open] summary::after{content:"收起"}
+.toc-inline nav{max-height:none!important;border:0!important;padding:10px 0 0!important}
+.toc-inline ol{list-style:none;margin:0;padding:0}
+.toc-inline ol ol{padding-left:16px}
+.toc-inline a{display:block;padding:3px 0;color:var(--fg)!important;text-decoration:none}
+.toc-inline ol ol a{color:var(--muted)!important}
+.toc-inline a:hover{color:var(--accent)!important}
+.post-toc{display:none!important}
+@media (min-width:1440px){
+  .post-toc{display:block!important;position:fixed;top:120px;left:calc(50% + 370px);width:220px;max-height:calc(100vh - 160px);overflow:auto;padding:0;border:0;background:none}
+  .toc-inline{display:none!important}
+}
+pre,pre.mermaid,table{max-width:100%}
+.post-nav{max-width:660px}
+.site-footer .footer-inner{max-width:660px;margin:0 auto}
+@media (max-width:640px){
+  .masthead-inner{padding:14px 0!important}
+  .sitenav a{padding:0 6px}
+  .home,.page,.post-layout{padding:12px 0 64px!important}
+  .intro.title{margin-bottom:40px!important}
+  .entry{grid-template-columns:7.6em minmax(0,1fr)!important;gap:12px!important}
+  .entry-title{font-size:17px!important}
+}
+.site-footer{max-width:660px;margin:0 auto;padding-inline:0}
+@media (max-width:640px){
+  .entry{grid-template-columns:minmax(0,1fr)!important;gap:2px!important}
+  .entry-date{padding-top:0!important}
+}
