@@ -1,0 +1,321 @@
+---
+title: Pi Durable 深度解析：给 Agent 用的“检查点状态机”式持久执行
+date: 2026-10-20
+tags: AI Agent, Durable Execution, TypeScript, 架构设计, 容错
+category: AI 基础设施
+summary: 从源码与规范拆解 @earendil-works/pi-durable：原子提交与“先提交后可见”、任务=检查点状态机、效果三明治与 replay 策略、memo 幂等、持久睡眠/等待、崩溃计数与停放、所有权树与中止、存储后端、ExecutionEnv 与 pi-env，以及与 Temporal 等的差异和实践要点。
+---
+<div class="callout">本文基于 <a href="https://github.com/earendil-works/pi/tree/main/packages/durable">earendil-works/pi · packages/durable</a> 提交 <code>73f8de80bc87021375f8b525292ac07492253002</code>（2026-10-19），主要材料是包内 <code>README.md</code>、规范 <code>docs/spec.md</code>（自称 normative）、<code>src/</code> 与 <code>test/examples/</code>，以及官方博文 <a href="https://earendil.com/posts/pi-durable/">Pi Durable</a>（2026-10-01）。代码片段路径相对 <code>packages/durable/</code>，有删节处以 <code>…</code> 标出。包状态为 <strong>Experimental</strong>，README 明说 API 会无预告变化。标注“未核实”的内容不来自上述源码。</div>
+
+<section id="why">
+<h2>1. 持久执行是什么，Agent 为什么需要</h2>
+<p>“持久执行”（durable execution）指：一段多步骤的工作在进程崩溃、重启、迁移后，能从已持久化的进度继续，而不是从头开始或悄悄丢失。Agent 恰好是这种工作的典型：一次 run 可能包含几十轮模型调用和工具调用，持续数小时；中途笔记本休眠、容器重新部署、OOM 都很常见。</p>
+<p>官方博文给出的目标很具体：一个“能在任何地方运行、可从不同界面接入、支持无限长对话、能扛住灾难性内外部故障、并允许多人同时操控同一个 Agent”的 harness。它与 Pi 编码 Agent 并列而非替代：后者面向终端里单人使用，崩了“你看一眼然后让它继续”；Pi Durable 是用来构建任意 Agent 应用（包括编码 Agent）的框架。</p>
+<p>规范开篇的核心规则只有一句：</p>
+<pre><code class="language-text">// docs/spec.md
+A Session atomically commits immutable entries, full task records, and
+Chord-tracked documents. Only committed state is observable.</code></pre>
+<p>“只有已提交的状态可见”——UI 看到的流式输出、工具进度也都是已落盘的（默认至多 100 ms 一次），崩溃最多丢掉最后一个节流窗口。</p>
+</section>
+
+<section id="arch">
+<h2>2. 整体架构</h2>
+<pre class="mermaid">
+flowchart TB
+  subgraph Host["宿主进程（Node / Bun / Cloudflare Durable Object）"]
+    APP["应用 / UI 客户端<br/>submit · viewState · watch · watchEvents"] --> H["Harness"]
+    H --> S["Session<br/>单一提交线（mutation line）"]
+    H --> SCH["Scheduler<br/>保留任务 → 在提交线外运行 phase"]
+    SCH --> T1["pi.generation 任务"]
+    SCH --> T2["pi.tool 任务"]
+    SCH --> T3["pi.compaction / 扩展任务"]
+    REG["Registry<br/>扩展：tools · sections · hooks · tasks"] -.每个 phase 开始时解析.-> SCH
+    T2 --> ENV["env() → ExecutionEnv"]
+    T1 --> AI["pi-ai Models"]
+  end
+  S --> ST[("Storage<br/>Memory · SQLite · JSONL · DO SQLite")]
+  ENV --> NODE["NodeExecutionEnv（本机）"]
+  ENV --> REMOTE["RemoteExecutionEnv（pi-env，经 SSH）"]
+  S -.Chord 文档 / 操作.-> APP
+</pre>
+<ul>
+<li><strong>Harness</strong>：一个打开的存储加上运行 Agent 的机制。所有变更走同一条原子提交线。</li>
+<li><strong>Conversation / Entry</strong>：对话是不可变条目（<code>pi.user</code>、<code>pi.assistant</code>、<code>pi.tool-result</code>、<code>pi.system</code>…）组成的转录，可 fork。</li>
+<li><strong>Document</strong>：与转录一同在同一提交里修改的类型化 JSON（基于 Chord 的事务化 JSON tracker），内置 <code>pi.agent</code>、<code>pi.live</code>、<code>pi.inbox</code>、<code>pi.usage</code> 等。</li>
+<li><strong>Task</strong>：持久状态机，每一步保存检查点。模型请求、工具调用、压缩全都是任务。</li>
+<li><strong>Chord</strong>（<code>@earendil-works/chord</code>）提供 Context（取消与遥测）、可观察 JSON 状态与增量协议、SQLite 适配等底座。</li>
+</ul>
+<p>一次被回答的输入，在 README 中是这样展开的：</p>
+<pre><code class="language-text">// README.md
+submit(input) → pi.user
+  pi.generation → pi.system (only if the prompt or tools changed), pi.assistant (tool calls)
+    pi.tool × n → pi.tool-result × n   (owned by the generation, which waits for them)
+  pi.generation → pi.assistant (answer) → submission done</code></pre>
+</section>
+
+<section id="model">
+<h2>3. 核心模型：检查点状态机，而不是事件重放</h2>
+<p>这是理解 Pi Durable 最关键的一点。Temporal 一类系统把工作流写成普通代码，靠<em>事件历史 + 确定性重放</em>恢复（这是对其公开文档的通用描述，本文未逐条核实）。Pi Durable 的规范在“非目标”里明确写着没有 “Session-kernel semantic event journal”。它的单位是<strong>任务</strong>：一个显式的、由若干 phase 组成的状态机，状态（checkpoint）是你自己定义的 JSON。</p>
+<h3>3.1 任务状态</h3>
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> pending: createTask
+  pending --> running: 调度器保留
+  running --> running: commit 新 checkpoint
+  running --> sleeping: sleepUntil
+  sleeping --> pending: 时钟到 until
+  running --> waiting: waiting on 子任务
+  waiting --> pending: 子任务全部终结 / failFast
+  running --> completing: 结果已定但仍有自有工作
+  completing --> terminal: 自有工作排空
+  running --> terminal: completed / failed / aborted
+  running --> pending: 崩溃后重开 restarts+1
+  pending --> pending: restarts 达上限 → 停放 blocked
+  terminal --> [*]
+</pre>
+<p>类型定义直接来自规范（节选）：</p>
+<pre><code class="language-ts">// docs/spec.md §5.1
+type TaskState&lt;S, R&gt; =
+  | { readonly status: "pending"; readonly checkpoint: S }
+  | { readonly status: "running"; readonly checkpoint: S }
+  | { readonly status: "waiting"; readonly checkpoint: S; readonly on: readonly TaskId[]; readonly policy: JoinPolicy }
+  | { readonly status: "sleeping"; readonly checkpoint: S; readonly until: number }
+  | { readonly status: "completing"; readonly outcome: TaskOutcome&lt;R&gt; }
+  | { readonly status: "terminal"; readonly outcome: TaskOutcome&lt;R&gt; };</code></pre>
+<p>注：状态图中“sleeping/waiting → pending”是本文为便于理解的画法；规范只说它们到点或子任务结束后“resumes at checkpoint”，未必经过名为 pending 的持久状态（未核实）。</p>
+<h3>3.2 “phase 从头重跑”——这就是确定性规则</h3>
+<p>没有“工作流代码必须确定”这种全局约束，取而代之的规则更朴素：<strong>一个 phase 在重启后从顶部重新执行</strong>，所以 phase 内部没有可恢复的中间点。README 关于睡眠的一段说得很直白：</p>
+<pre><code class="language-text">// README.md — Sleeping and Waking Up
+There is no sleep in the middle of a phase: a phase reruns from its top after a restart,
+so work after the wait goes in the next phase, and what it needs goes in the checkpoint.</code></pre>
+<p>也就是说，你要把“等待之后的工作”放进下一个 phase，并把它需要的数据放进 checkpoint。</p>
+<h3>3.3 效果三明治（effect sandwich）</h3>
+<pre><code class="language-text">// docs/spec.md §5.2
+commit intent phase
+perform external effect
+commit outcome or next phase</code></pre>
+<p>规范紧接着说明：重开时处于 intent phase，意味着<strong>副作用可能已经发生</strong>，phase 处理器要么安全重试、要么轮询外部句柄、要么记录“被中断”。规范的不变式 4 也规定：外部副作用绝不在 Session 事务内执行。</p>
+<h3>3.4 memo：首写者胜出的幂等原语</h3>
+<p>memo 是存放在任务记录里的小值，插入候选与读取胜者在同一次提交中完成，“首写者胜出”。<code>test/examples/13-recovery.ts</code> 用它避免崩溃后重复打印：</p>
+<pre><code class="language-ts">// test/examples/13-recovery.ts
+tick: async (task, runtime, taskContext) =&gt; {
+  const n = task.state.checkpoint.n;
+  // Save the intent before the effect. …
+  if ((await runtime.memo(`printed-${n}`, taskContext)) === undefined) {
+    await runtime.memo(`printed-${n}`, true, taskContext);
+    console.log(`tick ${n}`);
+  }
+  …
+  await runtime.sleepUntil(runtime.now() + 50, { phase: "tick", n: n + 1 }, taskContext);
+},</code></pre>
+<p>注意：memo 先写再打印，若崩溃发生在两者之间，这一行就不会再打印——它把“至少一次”换成了“至多一次”。对真实外部系统，博文的支付示例用的是另一种做法：把 <code>payment-${task.id}</code> 作为幂等键交给银行接口。</p>
+<h3>3.5 定时器与等待</h3>
+<ul>
+<li><strong>睡眠</strong>：<code>runtime.sleepUntil(until, nextCheckpoint)</code> 以提交结束当前 phase，任务不占用调用，跨重启存活；到时从 checkpoint 继续。重试退避、deferred 响应轮询都用同一机制。</li>
+<li><strong>时钟</strong>：通过 <code>now</code> / <code>setTimer</code> 注入，可用假时钟测试。README 提醒：睡眠截止时间按 <code>now</code> 存储，打开同一存储的所有进程必须使用同一时钟。</li>
+<li><strong>等待子任务</strong>：提交 <code>{ status: "waiting", on, policy }</code>，<code>allSettled</code> 等全部结束，<code>failFast</code> 首个失败即中止其余。</li>
+<li><strong>可被驱逐的宿主</strong>（如 Cloudflare Durable Object）：传 <code>onWake</code>，Harness 不再自设定时器，而是把 <code>{ active, at }</code> 告诉宿主去设闹钟，闹钟触发时调用 <code>resume()</code>。</li>
+</ul>
+<p>Pi Durable 没有名为“signal”的原语；外部输入通过 <strong>submission</strong> 进入（input / write，<code>whenBusy</code> 可选 follow-up、steer、reject），带 <code>requestId</code> 的提交只会被受理一次。</p>
+</section>
+
+<section id="recovery">
+<h2>4. 崩溃恢复全流程</h2>
+<pre class="mermaid">
+sequenceDiagram
+  participant C as 客户端
+  participant H as Harness / Session
+  participant S as Storage
+  participant M as 模型
+  participant T as 工具
+  C->>H: submit(input, requestId)
+  H->>S: commit pi.user + 创建 pi.generation
+  H->>S: generation: prepare → request（固定 model/cutoff）
+  H->>M: 流式请求
+  H->>S: 每 ≤100 ms 提交 partial 到 pi.live
+  H->>S: commit pi.assistant(tool calls) + 创建 pi.tool × n，进入 waiting
+  H->>S: tool: call → commit intent（phase execute, 参数, replay 策略）
+  H->>T: execute()
+  Note over H,T: 进程崩溃
+  C->>H: 新进程 Harness.open + resume()
+  H->>S: 存活的 running 记为 pending，restarts+1
+  alt replay = "safe"
+    H->>T: 用存储的参数重新 execute（不再跑 beforeTool）
+  else 非 safe
+    H->>S: commit interrupted 错误结果（含已提交的部分输出）
+  end
+  H->>S: generation 恢复，模型看到结果后继续
+  C->>H: submit(同一 requestId) → 返回原 submission
+</pre>
+<p>几条关键规则（均出自 <code>docs/spec.md</code>）：</p>
+<ul>
+<li><strong>模型请求</strong>（§8.3）：<code>request</code> 先把上次中断留下的 partial 转成一条 aborted 的 <code>pi.assistant</code> 条目，再用<em>同样已提交的消息、同样固定的模型、思考级别和流参数</em>重新请求。可重试错误按策略睡眠退避；deferred 结果进入 <code>poll</code> phase 定时 <code>fetchDeferred()</code>。</li>
+<li><strong>工具调用</strong>（§8.4）：<code>call</code> phase 校验参数、跑 <code>beforeTool</code>，然后一次提交记录意图并转入 <code>execute</code>。<code>execute</code> phase <em>只会被恢复路径到达</em>：当存储的与当前的策略都是 <code>safe</code> 才重跑，否则写入 <code>interrupted</code> 错误结果。</li>
+<li><strong>崩溃循环</strong>（§5.4）：打开存储时，每个残留的 <code>running</code> 任务被写回 <code>pending</code> 且 <code>restarts</code> 加一；正常 close 不计数；任务提交了<em>不同</em>的新状态才清零。达到 <code>restartLimit</code>（默认 5）就被停放（blocked: <code>restart_limit</code>），并以 <code>task_parked</code> 报告。</li>
+<li><strong>存储错误是致命的</strong>（README Errors）：命中存储错误后整个 Harness 失败并自行关闭，不做重试；宿主应监听 <code>harness.closed</code> 并重新打开。</li>
+</ul>
+<p>恢复过程的可运行演示就是 <code>test/examples/13-recovery.ts</code>：它在打印 tick 2 后、下一个检查点保存前关闭 Harness，再开一个新 Harness 继续数到 5。</p>
+</section>
+
+<section id="tools">
+<h2>5. 工具与 LLM 调用如何变得“持久”</h2>
+<h3>5.1 replay 策略</h3>
+<p>官方博文里的一组对比最能说明设计取舍：</p>
+<pre><code class="language-ts">// earendil.com/posts/pi-durable（博文示例，节选）
+const searchIssues = defineTool({
+  name: "search_issues",
+  …
+  replay: "safe", // only reads, so a rerun after a crash is fine
+  …
+});
+const deploy = defineTool({
+  name: "deploy",
+  …
+  // No replay: a deploy interrupted by a crash is reported to the model,
+  // never repeated.
+  execute: async (args) =&gt; ({ … }),
+});</code></pre>
+<p>默认不是 safe：被中断的调用不会被盲目重做，而是把“被中断 + 已有输出”作为错误结果交给模型，让模型决定下一步。这是 Agent 场景特有的一种恢复方式——把不确定性交还给推理者。</p>
+<h3>5.2 嵌套调用与 key</h3>
+<p>工具可用 <code>api.executeTool()</code> 调用其他工具，嵌套调用是调用者拥有的独立工具任务。每个嵌套调用有一个 key（默认是它在调用者嵌套调用中的序号）。README：一个 replay-safe 的调用者在崩溃后重跑、按相同顺序（或相同 key）调用时，会拿回已经发起的嵌套调用，而不是再启动一次。</p>
+<h3>5.3 Code Mode：唯一用到确定性重放的地方</h3>
+<p>Code Mode 让模型写 JavaScript，在 QuickJS 沙箱里以 <code>await tools.x()</code> 调用工具。这里才出现了 Temporal 式的确定性重放：</p>
+<pre><code class="language-ts">// src/codemode/codemode.ts（文件头注释节选）
+ * Solution: deterministic replay (`CodemodeSandboxBase.start()` in pi-codemode). The VM only runs when the host hands
+ * it a result; given the same start data, clock, seed, and results in the same order, it makes the same calls with
+ * the same arguments. The tool is replay-safe: after a restart, `execute()` runs again, starts the script again from
+ * the stored start data, and hands it the results it got before, in the order it got them, from a journal written
+ * before each delivery.</code></pre>
+<p>沙箱用虚拟时钟、带种子的随机数和 UTC 保证确定性；脚本在重放时若调用顺序与 journal 不符（发散），或模块版本/VM 指纹变化、截止时间已过，则拒绝重放并以错误结束该调用。</p>
+<h3>5.4 hooks 也要考虑重跑</h3>
+<p>博文的审批示例：<code>beforeTool</code> 钩子可能在崩溃后再次运行，因此把“已批准”存进 memo，重启后直接读到结论而不是再问一次人。</p>
+</section>
+
+<section id="concurrency">
+<h2>6. 并发、取消与所有权</h2>
+<ul>
+<li><strong>单写者</strong>：所有提交走一条 mutation line；commit 回调里不得 await 模型、工具、网络或人（spec §12 “Long transactions”）。存储同一时间只能被一个进程拥有，<strong>没有跨进程锁</strong>（README Storage）。</li>
+<li><strong>多对话并发</strong>：一个 Harness 同时跑任意多个对话；fork 在指定条目处共享父历史。</li>
+<li><strong>工具并行</strong>：<code>settings.toolExecution</code> 默认 <code>"parallel"</code>；一轮中只要有一个 sequential 调用，整轮按顺序执行（spec §7.3）。</li>
+<li><strong>所有权树</strong>（spec §5.5）：每个任务在创建时声明所有者（对话或另一个任务），不可变。“中止向下传递”，且任务只有在其自有工作排空后才会终结（<code>completing</code> 状态）。中止是自底向上的：先中止子任务，再运行自身的 abort 处理器，“so each task undoes its own effects”。</li>
+<li><strong>background</strong>：后台任务是边界，不阻止对话空闲，也不被普通中止触及，适合长期子 Agent 或“明天触发的提醒”。</li>
+<li><strong>Context 取消 ≠ 中止工作</strong>：取消一个调用者的 Context 只取消那个等待；要持久地中止共享工作必须提交 abort 标记（spec §5.4）。</li>
+</ul>
+</section>
+
+<section id="versioning">
+<h2>7. 版本与热重载</h2>
+<p>任务与文档都带 <code>version</code>。调度器每次启动任务调用时按记录的 <code>kind</code> 从当前 registry 快照解析定义：</p>
+<pre><code class="language-text">// docs/spec.md §5.4
+restarts at restartLimit           -&gt; stay pending, blocked: restart_limit
+definition missing                 -&gt; stay pending, blocked: missing_task
+stored version newer than it       -&gt; stay pending, blocked: task_too_old
+stored version older than it       -&gt; migrate(input, checkpoint, storedVersion)
+  failure                           -&gt; stay pending, blocked: migration_failed
+  success                           -&gt; commit migrated record + running atomically
+equal version                       -&gt; commit running</code></pre>
+<p>因为对话里只存扩展和工具的<em>名字</em>，registry 可以在运行中替换（同名 install 即替换）：已在运行的工具调用用旧代码跑完，下一 phase/请求/调用用新代码。文档迁移是“按访问驱动”的纯函数 <code>migrate()</code>，打开 Harness 时不做全量扫描（spec §3.6）。这与 Temporal 需要为工作流代码做版本分支的思路不同（后者为通用描述，未核实）：Pi 的迁移对象是显式的 checkpoint 数据而非执行历史。</p>
+</section>
+
+<section id="storage">
+<h2>8. 存储后端</h2>
+<table>
+<thead><tr><th>后端</th><th>要点（README Storage）</th></tr></thead>
+<tbody>
+<tr><td>Memory</td><td>不持久化，适合测试。</td></tr>
+<tr><td>SQLite（Node）</td><td>单文件，WAL + <code>synchronous = NORMAL</code>：扛进程崩溃；断电/宿主故障可能丢最新提交。长时间运行的 Agent 推荐它。</td></tr>
+<tr><td>JSONL</td><td>目录内追加写；<code>{ fsync: true }</code> 在每个提交标记前刷盘；整个历史也驻留内存。</td></tr>
+<tr><td>Cloudflare DO SQLite</td><td>Durable Object 的 SQLite，提交即其存储事务；可用 <code>prefix: "pi_"</code> 与宿主表共存。</td></tr>
+</tbody>
+</table>
+<p>SQLite/JSONL 核心不依赖 Node API，可跑在 Bun 或 Durable Object 里。自定义后端可用 <code>registerStorageConformance()</code> 跑共享一致性测试。Cloudflare 官方文档（2026-10-12 更新）还提供了 Agents SDK 的 <code>PiHarness</code>（beta），用 Lifecycle 任务做心跳与唤醒。</p>
+</section>
+
+<section id="env">
+<h2>9. ExecutionEnv：Node 与远程</h2>
+<p>工具只通过调用的执行环境接触文件与进程。<code>env</code> 函数会在<em>每次</em>工具调用、section 渲染时构建环境，拿到对话 ID、对话的 <code>cwd</code> 与已提交读取：</p>
+<pre><code class="language-ts">// test/examples/29-sandbox-per-conversation.ts
+env: async ({ conversationId, read }, envContext) =&gt; {
+  const sandbox = await read.snapshot(Sandbox, conversationId, envContext);
+  return sandbox?.path === undefined ? undefined : new NodeExecutionEnv({ cwd: sandbox.path });
+},</code></pre>
+<p>换成远程只需返回 pi-env 的 <code>RemoteExecutionEnv</code>：Durable worker、存储与凭据留在本地，工具跑在 SSH 另一端的 Rust 守护进程里（详见本站的 <a href="pi-env-internals.html">pi-env 源码精读</a>）。pi-env 的 README（同一提交）给出的组合：</p>
+<pre><code class="language-ts">// packages/env/README.md
+const { connection } = await connectSsh(target);
+const env = new RemoteExecutionEnv({ connection, id: "pi-env:gpu", cwd: "/home/me/project" });</code></pre>
+<ul>
+<li><code>id</code> 很重要：<code>edit</code> 与 <code>write</code> 按环境 <code>id</code> + 路径串行化同一文件的修改；“相同 id 看到相同路径下的相同文件”。</li>
+<li>两者都能用 <code>registerEnvConformance()</code> 自检——pi-env 正是用这套测试证明与 <code>NodeExecutionEnv</code> 语义一致。</li>
+<li>规范的一个陷阱：恢复后重跑的工具会<em>重新构建</em>环境，用的是对话<em>当前</em>的 <code>cwd</code>，可能与第一次不同（spec §12 “Environment on recovery”）。</li>
+</ul>
+</section>
+
+<section id="compare">
+<h2>10. 与其他持久执行系统的对比</h2>
+<div class="callout warn">下表中 Pi Durable 一列来自本文引用的源码与文档；其他系统一列是对其公开文档的概括，<strong>本文未逐条核实</strong>，请以各自官方文档为准。</div>
+<table>
+<thead><tr><th>维度</th><th>Pi Durable</th><th>Temporal / Restate / DBOS / Inngest / CF Workflows（概括，未核实）</th></tr></thead>
+<tbody>
+<tr><td>恢复机制</td><td>显式 phase 状态机 + 自定义 checkpoint；phase 从头重跑。仅 Code Mode 用确定性重放</td><td>Temporal：事件历史 + 确定性重放工作流代码；Restate/DBOS/Inngest/CF Workflows：以“步骤”结果日志为主</td></tr>
+<tr><td>部署形态</td><td>库，嵌入宿主进程；一个存储一个拥有者进程</td><td>多为独立服务/集群或托管平台（DBOS 为库 + Postgres）</td></tr>
+<tr><td>领域对象</td><td>对话、条目、文档、submission、inbox、压缩、模型/工具任务内建</td><td>通用工作流，Agent 语义需自建</td></tr>
+<tr><td>副作用恢复</td><td>工具声明 <code>replay: "safe"</code>，否则“告诉模型被中断”</td><td>通常为“步骤至少一次 + 幂等键”</td></tr>
+<tr><td>观察</td><td>只暴露已提交状态；Chord 增量 / Agent 事件流</td><td>各自的 UI/查询 API</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="practice">
+<h2>11. 实践：从最小例子到长时间运行的编码 Agent</h2>
+<h3>11.1 最小例子（README Quick Start，节选）</h3>
+<pre><code class="language-ts">const harness = await Harness.open(new MemoryStorage(), { models, registry: createRegistry() }, context);
+const root = await harness.root(context, { agent: { model: { provider: "openai", modelId: "gpt-6-sol" } } });
+const submission = await root.submit({ type: "input", content: "What is the capital of France?" }, context);
+const settled = await submission.wait(context);</code></pre>
+<h3>11.2 可恢复的编码 Agent（README Persist and Resume）</h3>
+<pre><code class="language-ts">const harness = await Harness.open(await openNodeSqliteStorage("./session.sqlite"), { models, registry }, context);
+const root = await harness.root(context); // the same root as last time
+harness.resume(); // continue any run the last process left unfinished
+…
+const again = await root.submit({ type: "input", content: "Hello", requestId: "greeting-1" }, context);
+// again.id === submission.id</code></pre>
+<p>编码工具来自 <code>@earendil-works/pi-durable/tools</code>（<code>read</code>、<code>write</code>、<code>edit</code>、<code>bash</code>，合为 <code>CodingTools</code>）。完整示例见 <code>test/examples/26-coding-agent.ts</code>；在 <code>v1.0.0</code> 标签里，<code>packages/coding-agent/src/experimental/durable/</code> 有一个基于 Pi Durable 的小型编码 Agent（其 <code>harness-setup.ts</code> 按 cwd 缓存 <code>NodeExecutionEnv</code>）。在本文所用的 main 提交里，该目录已不在 coding-agent 包中，coding-agent 的 <code>package.json</code> 也不依赖 pi-durable——两者目前是并列的。</p>
+<h3>11.3 子 Agent（README Abort and Subagents，节选）</h3>
+<pre><code class="language-ts">replay: "safe", // a rerun after a crash finds the same child and submission
+execute: async (args, api, context) =&gt; {
+  const child = await api.commit(async (tx) =&gt; {
+    // The ownership index remembers the child, so a rerun reuses it.
+    const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
+    if (existing !== undefined) return existing.id;
+    const created = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
+    …</code></pre>
+<p>这个模式把“重跑安全”落到实处：重跑时先查是否已有子对话，提交用 <code>requestId: `subagent:${api.taskId}`</code> 去重。</p>
+<h3>11.4 远程环境</h3>
+<p>把 <code>env</code> 换成返回 <code>RemoteExecutionEnv</code> 的函数（见第 9 节）。懒连接的 <code>sshConnection()</code> 会让 SSH 失败成为那次工具调用的错误结果，下一次调用再试，恰好与工具任务的错误语义相容。</p>
+</section>
+
+<section id="pitfalls">
+<h2>12. 陷阱与最佳实践</h2>
+<div class="grid2">
+  <div class="card"><h4>副作用别放进 commit</h4>commit 回调持有提交线；不要在里面 await 模型、进程、网络或人。在 commit 里读 <code>snapshot()</code> 之类会排队等提交线，可能永远不返回（spec §12）。</div>
+  <div class="card"><h4>默认不 safe</h4>只有只读或天然幂等的工具才声明 <code>replay: "safe"</code>；有外部写入时用幂等键（如 <code>task.id</code>）或 memo 记录决定。</div>
+  <div class="card"><h4>checkpoint 里放续跑所需的一切</h4>phase 会从头重跑；等待之后的工作放到下一个 phase。</div>
+  <div class="card"><h4>大结果别放终态记录</h4>终态记录长期可查；大结果放条目或文档，只在 outcome 里存 ID。</div>
+  <div class="card"><h4>单进程拥有存储</h4>没有跨进程锁，多个 worker 打开同一存储是未定义的使用方式；横向扩展按“会话→进程/DO”分片（推论，非官方表述）。</div>
+  <div class="card"><h4>稳定的 prompt</h4>section 输出若每次都变（如嵌入当前时间）会追加 system 增量并让提供方的 prompt cache 失效。</div>
+  <div class="card"><h4>监听 closed 并重开</h4>存储错误会终结 Harness；重试应在自定义 Storage 内部做。</div>
+  <div class="card"><h4>文档要设 checkpointWhen</h4><code>() =&gt; false</code> 会让增量回放无界增长（spec §12 “Checkpoint starvation”）。</div>
+</div>
+</section>
+
+<section id="takeaways">
+<h2>13. 小结</h2>
+<ol>
+<li><strong>“只有已提交的才可见”</strong>是一切的地基：UI、流式输出、子 Agent 状态都从持久状态派生，崩溃后看到的就是真实进度。</li>
+<li><strong>检查点状态机代替事件重放</strong>：开发者显式划分 phase、自定义 checkpoint，迁移的是数据而非历史；确定性重放只在 Code Mode 这种“脚本”场景局部使用。</li>
+<li><strong>Agent 化的副作用语义</strong>：非 safe 工具中断后不重做，而是把“被中断 + 部分输出”交给模型；模型请求则用固定参数重发，partial 作为 aborted 条目保留。</li>
+<li><strong>所有权树统一了取消与清理</strong>：子任务、子对话、后台边界与自底向上的 abort，让子 Agent、并行支付这类结构天然可恢复。</li>
+<li><strong>可移植的底座</strong>：小巧的 Storage 与 ExecutionEnv 接口 + 一致性测试，让同一 harness 跑在 Node、Bun、Cloudflare DO 上，并通过 pi-env 把工具放到远端机器。</li>
+</ol>
+<p class="muted">来源：packages/durable（README.md、docs/spec.md、src/codemode/codemode.ts、test/examples/13、29）、packages/env/README.md，提交 73f8de80；earendil.com/posts/pi-durable、earendil.com/posts/pi-1-0；developers.cloudflare.com/agents/harnesses/pi；v1.0.0 标签下 packages/coding-agent/src/experimental/durable/harness-setup.ts。</p>
+</section>
