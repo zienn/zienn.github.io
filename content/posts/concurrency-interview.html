@@ -1,0 +1,435 @@
+---
+title: 并发编程面试题详解：5 道“程序可能输出什么”的题与背后原理
+date: 2026-11-03
+tags: 并发, Java, JMM, Go, asyncio, 死锁, 面试
+category: 面试
+summary: 5 道经典并发面试题（count++ 丢失更新、Store-Load 重排序、Go WaitGroup 与循环变量捕获、asyncio 阻塞事件循环、嵌套锁死锁）的可能输出、逐步推演、底层原理、修复代码与追问参考答案。
+---
+<div class="callout"><strong>怎么用这篇文章</strong>每道题都按“题目 → 可能输出 → 详细解析 → 原理 → 修复 → 面试追问”展开。面试时让候选人先说<strong>可能的结果</strong>，再讲<strong>为什么</strong>，最后讲<strong>怎么修</strong>。并发题的关键不在“标准答案”，而在于候选人是否意识到：并发程序的输出是一个<strong>集合</strong>，不是一个值。</div>
+
+<section id="overview">
+<h2>总览</h2>
+<table>
+<thead><tr><th>#</th><th>题目</th><th>可能结果</th><th>考察点</th><th>难度</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Java 两线程各 count++ 一万次</td><td>[2, 20000] 之间任意值</td><td>原子性、读-改-写、CAS、LongAdder</td><td>★★</td></tr>
+<tr><td>2</td><td>Java a/b/x/y 重排序</td><td>(0,1)(1,0)(1,1)，以及 <strong>(0,0)</strong></td><td>可见性、Store Buffer、JMM、happens-before、volatile</td><td>★★★★</td></tr>
+<tr><td>3</td><td>Go 循环里 go func + wg.Add</td><td>什么都不打印 / 部分打印；值与 Go 版本有关</td><td>WaitGroup 用法、闭包捕获、Go 1.22 loopvar</td><td>★★★</td></tr>
+<tr><td>4</td><td>asyncio + time.sleep</td><td>1 2 3，耗时约 3 秒</td><td>事件循环、协作式调度、阻塞调用、GIL</td><td>★★</td></tr>
+<tr><td>5</td><td>嵌套 synchronized 转账</td><td>可能死锁</td><td>Coffman 四条件、锁排序、tryLock、行锁、分布式锁 fencing</td><td>★★★</td></tr>
+</tbody>
+</table>
+</section>
+
+<section id="q1">
+<h2>题一：丢失更新（Java count++）</h2>
+<h3>题目</h3>
+<pre><code class="language-java">static int count = 0;
+public static void main(String[] args) throws Exception {
+    Thread t1 = new Thread(() -&gt; { for (int i = 0; i &lt; 10000; i++) count++; });
+    Thread t2 = new Thread(() -&gt; { for (int i = 0; i &lt; 10000; i++) count++; });
+    t1.start(); t2.start();
+    t1.join(); t2.join();
+    System.out.println(count);
+}</code></pre>
+<p><strong>问</strong>：可能输出什么？最小值是多少？</p>
+
+<h3>可能输出</h3>
+<p>闭区间 <strong>[2, 20000]</strong> 内的任意值。实际运行通常是一个略小于 20000 的数（在循环很短、线程启动有先后时也经常恰好是 20000，这正是这类 bug 难以复现的原因）。理论最小值是 <strong>2</strong>，不是很多人以为的 10000。</p>
+
+<h3>详细解析</h3>
+<p><code>count++</code> 不是一个操作。编译成字节码后是：</p>
+<pre><code class="language-java">getstatic  count   // 1. 读：把 count 读到操作数栈（JIT 后通常是读到寄存器）
+iconst_1
+iadd               // 2. 改：在线程私有的栈/寄存器里 +1
+putstatic  count   // 3. 写：写回共享变量</code></pre>
+<p>“读”和“写”之间存在窗口，另一个线程在窗口内的所有写入都会被这次写回<strong>覆盖</strong>，这就是“丢失更新”（lost update）。</p>
+<p><strong>为什么最小是 2 而不是 10000？</strong>下面是一条合法的交错（记 A=t1，B=t2，各要做 10000 次）：</p>
+<ol>
+<li>A 读到 0，暂停（寄存器里是 0）。</li>
+<li>B 连续完成 9999 次自增，count = 9999。</li>
+<li>A 恢复，写回 0+1 = <strong>1</strong>。B 的 9999 次全被覆盖。</li>
+<li>B 开始最后一次：读到 1，暂停（寄存器里是 1）。</li>
+<li>A 完成剩下的 9999 次，count = 10000。A 结束。</li>
+<li>B 恢复，写回 1+1 = <strong>2</strong>。B 结束。</li>
+</ol>
+<p>最终输出 2。能不能是 1？不能：每个线程的最后一次写入值至少是“它读到的值 + 1”，而它最后一次读之前自己已经写过至少一次（≥1），所以最后写入的值 ≥ 2。（严格说每个线程的第二次及以后的读，都能读到自己之前的写，JMM 保证同一线程内的程序顺序。）</p>
+<pre class="mermaid">
+sequenceDiagram
+  participant A as 线程 t1
+  participant M as count (共享内存)
+  participant B as 线程 t2
+  A->>M: 读 0
+  Note over A: 被挂起，寄存器=0
+  B->>M: 自增 9999 次 → 9999
+  A->>M: 写 1（覆盖 9999）
+  B->>M: 读 1
+  Note over B: 被挂起，寄存器=1
+  A->>M: 自增 9999 次 → 10000，结束
+  B->>M: 写 2（覆盖 10000）
+</pre>
+
+<h3>原理</h3>
+<ul>
+<li><strong>原子性</strong>：一个操作要么全做完、要么没开始，中间状态不可被他人观察。<code>count++</code> 是“读-改-写”（read-modify-write）复合操作，天然不原子。</li>
+<li><strong>为什么 volatile 修不好</strong>：<code>volatile</code> 只保证可见性（写完别人立刻能看到最新值）和禁止相关重排序，不保证复合操作原子。两个线程仍然可能读到同一个值然后各自写回。JLS 也只规定 volatile 变量的单次读、写是原子的（包括 long/double，见 <a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html#jls-17.7">JLS §17.7</a>）。</li>
+<li><strong>CAS（Compare-And-Swap）</strong>：<code>AtomicInteger.incrementAndGet()</code> 底层是 CPU 原子指令（x86 上是 <code>lock xadd</code> / <code>lock cmpxchg</code>）。CAS 语义是“如果内存值仍是我读到的旧值，就写入新值，否则失败重试”，把读-改-写变成一个不可分割的硬件操作。</li>
+<li><strong>synchronized</strong>：用监视器锁让临界区互斥，同时带来 happens-before（解锁先行于后续加锁），所以既原子又可见。代价是竞争激烈时线程会阻塞、上下文切换。</li>
+<li><strong>LongAdder</strong>：高竞争下所有线程 CAS 同一个缓存行，会导致大量失败重试和缓存行在核之间来回传递（cache line ping-pong）。<a href="https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/atomic/LongAdder.html">LongAdder</a> 把计数分散到多个 Cell（带 <code>@Contended</code> 填充避免伪共享），各线程加自己的 Cell，<code>sum()</code> 时再求和。写吞吐远高于 AtomicLong，代价是 <code>sum()</code> 不是原子快照、占用更多内存，不适合需要“读到精确值再做决定”的场景（如 CAS 发号）。</li>
+</ul>
+
+<h3>修复</h3>
+<pre><code class="language-java">// 方案 1：原子类（低到中等竞争首选）
+static final AtomicInteger count = new AtomicInteger();
+// 循环体：count.incrementAndGet();
+
+// 方案 2：锁（临界区里还有别的逻辑时）
+static int count = 0;
+static final Object lock = new Object();
+// 循环体：synchronized (lock) { count++; }
+
+// 方案 3：高并发统计计数（只关心最终总数）
+static final LongAdder adder = new LongAdder();
+// 循环体：adder.increment();   最后：adder.sum()</code></pre>
+
+<h3>面试追问与参考答案</h3>
+<ul>
+<li><strong>volatile 能修好吗？</strong>不能，理由见上。能讲出“可见性 ≠ 原子性”即可。</li>
+<li><strong>CAS 有什么问题？</strong>① ABA 问题（用 <code>AtomicStampedReference</code> 加版本号）；② 高竞争下自旋浪费 CPU；③ 只能保证单个变量原子，多变量需要锁或把状态打包进一个对象。</li>
+<li><strong>为什么结果经常恰好是 20000？</strong>循环太短，t1 可能在 t2 启动前就跑完了；JIT 也可能把循环优化成少量读写。这说明“测试通过”不能证明没有竞态，应该用 jcstress 这类工具做压力验证。</li>
+</ul>
+</section>
+
+<section id="q2">
+<h2>题二：可见性与重排序（Store-Load）</h2>
+<h3>题目</h3>
+<pre><code class="language-java">static int a = 0, b = 0, x = 0, y = 0;
+// 线程1          // 线程2
+a = 1;            b = 1;
+x = b;            y = a;</code></pre>
+<p><strong>问</strong>：两个线程都结束后，<code>(x, y)</code> 可能有哪几种组合？</p>
+
+<h3>可能输出</h3>
+<p><code>(0,1)</code>、<code>(1,0)</code>、<code>(1,1)</code>，以及<strong><code>(0,0)</code></strong>。</p>
+
+<h3>详细解析</h3>
+<p>如果只考虑“语句按顺序执行、只是交错”（即<strong>顺序一致性</strong>，Sequential Consistency）：</p>
+<ul>
+<li>线程 1 全部先跑：x=0，y=1 → (0,1)</li>
+<li>线程 2 全部先跑：x=1，y=0 → (1,0)</li>
+<li>两个写都先发生、再读：(1,1)</li>
+</ul>
+<p>在顺序一致性下 (0,0) 不可能：要 x=0，<code>x=b</code> 必须在 <code>b=1</code> 之前；要 y=0，<code>y=a</code> 必须在 <code>a=1</code> 之前；再加上程序顺序 <code>a=1</code> 在 <code>x=b</code> 前、<code>b=1</code> 在 <code>y=a</code> 前，就形成了环 a=1 → x=b → b=1 → y=a → a=1，矛盾。</p>
+<p>但真实的 JVM 和 CPU 都不是顺序一致的，(0,0) 确实能观察到，原因有两层：</p>
+<ol>
+<li><strong>编译器重排序</strong>：<code>a=1</code> 和 <code>x=b</code> 访问不同变量，单线程语义下没有依赖，javac/JIT 可以把 <code>x=b</code> 提前。</li>
+<li><strong>CPU 的 Store Buffer</strong>：即使指令顺序不变，CPU 写内存时先把写放进本核的<strong>写缓冲区</strong>，然后继续执行后面的读。线程 1 的 <code>a=1</code> 还在自己的 store buffer 里、对线程 2 不可见时，线程 1 已经读了 b（还是 0）；线程 2 对称地发生同样的事 → (0,0)。</li>
+</ol>
+<pre class="mermaid">
+sequenceDiagram
+  participant C1 as CPU1 (线程1)
+  participant SB1 as CPU1 Store Buffer
+  participant MEM as 主存/缓存一致性域
+  participant SB2 as CPU2 Store Buffer
+  participant C2 as CPU2 (线程2)
+  C1->>SB1: a=1（暂存，未提交）
+  C2->>SB2: b=1（暂存，未提交）
+  C1->>MEM: 读 b → 0
+  C2->>MEM: 读 a → 0
+  SB1->>MEM: 提交 a=1
+  SB2->>MEM: 提交 b=1
+  Note over C1,C2: 结果 x=0, y=0
+</pre>
+
+<h3>原理</h3>
+<ul>
+<li><strong>CPU 内存模型</strong>：x86 使用 TSO（Total Store Order），它只允许一种重排：<strong>Store→Load</strong>（较早的写可以晚于较晚的读对外可见），正是本题的情况。所以这道题在 x86 上也能复现。ARM、POWER 是更弱的模型，Load-Load、Store-Store 等也可能重排。参考 Sewell 等人的 <a href="https://www.cl.cam.ac.uk/~pes20/weakmemory/cacm.pdf">x86-TSO: A Rigorous and Usable Programmer's Model</a>。</li>
+<li><strong>JMM（Java 内存模型）</strong>：Java 为了跨平台，不承诺顺序一致，而是定义 <a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html#jls-17.4.5">happens-before</a> 关系：只有两个操作之间存在 happens-before，后者才保证看到前者的结果。本题的普通读写之间没有 happens-before，而且对同一变量有并发读写，是一个<strong>数据竞争</strong>（data race），JMM 允许 (0,0)。</li>
+<li><strong>happens-before 的常用来源</strong>：程序顺序（同一线程内）；监视器解锁 → 之后对同一锁的加锁；volatile 写 → 之后对同一变量的 volatile 读；<code>Thread.start()</code> → 新线程内的操作；线程内所有操作 → 其他线程 <code>join()</code> 返回；以及传递性。</li>
+<li><strong>DRF-SC 保证</strong>：JMM 承诺，<strong>没有数据竞争的程序</strong>（所有冲突访问都由 happens-before 排好序）表现得就像顺序一致（<a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html#jls-17.4.5">JLS §17.4.5</a>）。所以工程上的原则是：消除数据竞争，而不是去推理重排。</li>
+<li><strong>volatile 与内存屏障</strong>：把 a、b 都声明为 volatile 后，所有 volatile 访问构成一个全序（synchronization order），并且与程序顺序一致，(0,0) 不再可能。HotSpot 在 x86 上的实现是在 volatile 写之后插入一条 StoreLoad 屏障（<code>lock addl $0,(%rsp)</code> 或 <code>mfence</code>），强制清空 store buffer 后才执行后续读。</li>
+</ul>
+
+<h3>修复</h3>
+<pre><code class="language-java">static volatile int a = 0, b = 0;
+static int x = 0, y = 0;
+// 线程1: a = 1; x = b;      线程2: b = 1; y = a;
+// 现在只可能是 (0,1) (1,0) (1,1)</code></pre>
+
+<h3>面试追问与参考答案</h3>
+<ul>
+<li><strong>加 volatile 后还会出现 (0,0) 吗？</strong>不会。volatile 读写在同步顺序中全序，且与程序顺序一致，推理回到上面的“成环矛盾”。</li>
+<li><strong>双重检查锁（DCL）单例为什么要 volatile？</strong>
+<pre><code class="language-java">class Singleton {
+    private static volatile Singleton instance;
+    static Singleton get() {
+        if (instance == null) {                 // 第一次检查，无锁
+            synchronized (Singleton.class) {
+                if (instance == null) {         // 第二次检查
+                    instance = new Singleton();
+                }
+            }
+        }
+        return instance;
+    }
+}</code></pre>
+<code>new Singleton()</code> 大致是：分配内存 → 执行构造函数 → 把引用赋给 instance。没有 volatile 时，后两步可以重排，另一个线程在第一次检查（无锁路径，和写线程之间没有 happens-before）就可能看到<strong>非空但未构造完</strong>的对象。volatile 写之前的构造操作 happens-before 读到该引用的 volatile 读，问题消失。更简单的写法是静态内部类（Holder）或枚举单例，依赖类初始化锁。</li>
+<li><strong>什么是 final 字段的初始化安全？</strong>对象正确构造（构造期间 this 未逸出）后，其他线程即使通过数据竞争拿到引用，也能看到 final 字段的构造值（<a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html#jls-17.5">JLS §17.5</a>）。</li>
+</ul>
+</section>
+
+<section id="q3">
+<h2>题三：Go 的 WaitGroup 与循环变量捕获</h2>
+<h3>题目</h3>
+<pre><code class="language-go">func main() {
+    var wg sync.WaitGroup
+    for i := 0; i &lt; 3; i++ {
+        go func() {
+            wg.Add(1)
+            defer wg.Done()
+            fmt.Println(i)
+        }()
+    }
+    wg.Wait()
+}</code></pre>
+<p><strong>问</strong>：输出什么？</p>
+
+<h3>可能输出</h3>
+<ul>
+<li><strong>什么都不打印</strong>（最常见）：main 执行到 <code>wg.Wait()</code> 时计数器还是 0，立即返回，main 退出，进程结束，goroutine 被直接丢弃。</li>
+<li><strong>打印一部分</strong>：某些 goroutine 先跑了 <code>Add(1)</code>，Wait 会等它们，其余的来不及跑。</li>
+<li><strong>打印的值</strong>：Go 1.22 起是 0、1、2 中对应子集的任意顺序；Go 1.21 及更早（或 go.mod 声明的 go 版本低于 1.22），所有闭包共享同一个 <code>i</code>，常见打印 3（循环早已结束），也可能是中间值。</li>
+</ul>
+
+<h3>详细解析</h3>
+<p><strong>坑一：Add 的位置。</strong><code>go</code> 语句只是创建 goroutine 并放入调度队列，不等它开始执行。主 goroutine 很可能先跑完 for 循环并到达 <code>Wait()</code>，此时没人调用过 <code>Add</code>，计数为 0，<code>Wait</code> 立即返回。<a href="https://pkg.go.dev/sync#WaitGroup.Add">sync 文档</a>明确要求：计数从 0 变正的 <code>Add</code> 调用必须发生在 <code>Wait</code> 之前，通常应在创建 goroutine 的语句之前调用。另外 Go 程序在 <code>main</code> 返回时直接退出，不等待其他 goroutine。</p>
+<pre class="mermaid">
+sequenceDiagram
+  participant M as main goroutine
+  participant S as 调度器
+  participant G as goroutine 0..2
+  M->>S: go func() ×3（只是入队）
+  M->>M: wg.Wait()，计数=0，立即返回
+  M->>M: main 返回，进程退出
+  Note over G: 还没被调度，wg.Add 从未执行
+</pre>
+<p><strong>坑二：闭包捕获 i。</strong>闭包捕获的是<strong>变量</strong>而不是值。Go 1.22 之前，<code>for i := ...</code> 的 i 在整个循环里只有一个，所有闭包引用同一个地址，goroutine 真正运行时 i 多半已经是 3。这同时还是一个数据竞争（main 写 i、goroutine 读 i），<code>go run -race</code> 会报。</p>
+<p>Go 1.22 修改了语义：<strong>每次迭代都创建新的循环变量</strong>（<a href="https://go.dev/doc/go1.22#language">Go 1.22 Release Notes</a>，<a href="https://go.dev/blog/loopvar-preview">Fixing For Loops in Go 1.22</a>）。新语义按模块的 go.mod 中 <code>go</code> 指令版本生效，因此老项目升级工具链但不改 go.mod 时，仍是旧行为。</p>
+
+<h3>原理</h3>
+<ul>
+<li><strong>WaitGroup</strong> 是一个计数器 + 等待队列：<code>Add(n)</code> 增减计数，<code>Done()</code> 等于 <code>Add(-1)</code>，<code>Wait()</code> 阻塞到计数为 0。它不知道“将来会有多少个 goroutine”，只看当下的计数。</li>
+<li><strong>Go 内存模型</strong>：<code>go</code> 语句先行于新 goroutine 的执行开始，但不保证新 goroutine 何时运行（<a href="https://go.dev/ref/mem">The Go Memory Model</a>）。</li>
+<li><strong>Go 1.25</strong> 新增了 <code>wg.Go(func(){...})</code>，把 Add 和 Done 封装在一起，从 API 上消除了这个坑（<a href="https://pkg.go.dev/sync#WaitGroup.Go">sync.WaitGroup.Go</a>）。</li>
+</ul>
+
+<h3>修复</h3>
+<pre><code class="language-go">func main() {
+    var wg sync.WaitGroup
+    for i := 0; i &lt; 3; i++ {
+        wg.Add(1)              // 在 go 之前 Add
+        go func(n int) {       // 显式传值，不依赖 Go 版本
+            defer wg.Done()
+            fmt.Println(n)
+        }(i)
+    }
+    wg.Wait()
+}
+// 输出 0 1 2 的某个排列，顺序不保证
+
+// Go 1.25+ 更简洁：
+// for i := range 3 { wg.Go(func() { fmt.Println(i) }) }</code></pre>
+
+<h3>面试追问与参考答案</h3>
+<ul>
+<li><strong>怎么让输出有序？</strong>不要用 goroutine，或者每个 goroutine 把结果写到 <code>results[i]</code>，Wait 之后按下标打印；或者用 channel 按顺序串联。</li>
+<li><strong>Wait 返回后，主 goroutine 能安全读 goroutine 写入的数据吗？</strong>能。<code>Done</code> 与使 <code>Wait</code> 返回之间有同步关系（文档称 Done “synchronizes before” 它解除阻塞的 Wait 返回）。</li>
+<li><strong>怎么发现这类问题？</strong><code>go vet</code>（有 loopclosure 检查）、<code>-race</code> 竞态检测器、以及 errgroup（<code>golang.org/x/sync/errgroup</code>）这类更高层的封装。</li>
+</ul>
+</section>
+
+<section id="q4">
+<h2>题四：asyncio 的“伪并发”</h2>
+<h3>题目</h3>
+<pre><code class="language-python">import asyncio, time
+async def task(n):
+    time.sleep(1)          # 注意不是 asyncio.sleep
+    print(n)
+async def main():
+    start = time.time()
+    await asyncio.gather(task(1), task(2), task(3))
+    print(round(time.time() - start))
+asyncio.run(main())</code></pre>
+<p><strong>问</strong>：输出顺序是什么？总耗时多少？</p>
+
+<h3>可能输出</h3>
+<pre><code class="language-text">1
+2
+3
+3</code></pre>
+<p>每隔约 1 秒打印一个数，最后一行耗时是 <strong>3</strong>（秒）。</p>
+
+<h3>详细解析</h3>
+<p><code>gather</code> 把三个协程包成 Task，按创建顺序放入事件循环的就绪队列。事件循环是<strong>单线程</strong>的：它取出 task(1) 执行，task(1) 调用 <code>time.sleep(1)</code>，这是普通的阻塞系统调用，整个线程（包括事件循环）睡 1 秒。task(1) 里没有任何 <code>await</code>，所以它不会让出控制权，一口气跑到结束打印 1。然后才轮到 task(2)、task(3)。三个任务完全串行，总耗时约 3 秒。</p>
+<p>换成 <code>await asyncio.sleep(1)</code> 后：task(1) 在 await 处挂起并注册 1 秒后的定时器，事件循环立刻切到 task(2)、task(3)；约 1 秒后三个定时器到期，依次恢复。总耗时约 1 秒。打印顺序在 CPython 当前实现下通常仍是 1 2 3（定时器按到期时间和注册顺序排列），但这是实现细节，语言不保证。</p>
+<pre class="mermaid">
+sequenceDiagram
+  participant L as 事件循环（单线程）
+  participant T1 as task(1)
+  participant T2 as task(2)
+  participant T3 as task(3)
+  L->>T1: 运行
+  Note over T1,L: time.sleep(1) 阻塞整个线程
+  T1-->>L: print(1)，完成
+  L->>T2: 运行
+  Note over T2,L: 再阻塞 1 秒
+  T2-->>L: print(2)，完成
+  L->>T3: 运行
+  Note over T3,L: 再阻塞 1 秒
+  T3-->>L: print(3)，完成
+</pre>
+
+<h3>原理</h3>
+<ul>
+<li><strong>协作式调度</strong>：协程只有在 <code>await</code> 一个尚未完成的 awaitable 时才会让出控制权。事件循环无法抢占一个正在运行的协程。所以 async 代码里任何阻塞调用（<code>time.sleep</code>、<code>requests.get</code>、同步数据库驱动、大计算）都会冻结整个循环，所有其他请求一起卡住。</li>
+<li><strong>asyncio.sleep</strong> 并不阻塞线程，它创建一个 Future，用 <code>loop.call_later</code> 安排定时回调后挂起当前协程。</li>
+<li><strong>调试</strong>：开启 debug 模式（<code>asyncio.run(main(), debug=True)</code> 或 <code>PYTHONASYNCIODEBUG=1</code>）后，执行超过 100ms 的回调会被记录为慢回调，便于找出阻塞点（<a href="https://docs.python.org/3/library/asyncio-dev.html">Developing with asyncio</a>）。</li>
+<li><strong>同步代码怎么接入</strong>：<a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.to_thread"><code>asyncio.to_thread</code></a>（3.9+）或 <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor"><code>loop.run_in_executor</code></a> 把阻塞函数丢到线程池执行，协程 await 其结果。</li>
+<li><strong>GIL</strong>：CPython 的全局解释器锁同一时刻只允许一个线程执行 Python 字节码。<code>time.sleep</code>、文件和网络 I/O 会释放 GIL，所以放进线程池能真正并行等待；但纯 Python 的 CPU 密集计算放进线程池并不会变快，应该用 <code>ProcessPoolExecutor</code>。（3.13 起有实验性的 free-threaded 构建可去掉 GIL，但默认构建仍有 GIL。）</li>
+</ul>
+
+<h3>修复</h3>
+<pre><code class="language-python">import asyncio, time
+
+async def task(n):
+    await asyncio.sleep(1)               # 非阻塞
+    print(n)
+
+async def task_with_sync_sdk(n):
+    await asyncio.to_thread(time.sleep, 1)   # 只能调用同步 SDK 时
+    print(n)
+
+async def main():
+    start = time.time()
+    await asyncio.gather(task(1), task(2), task(3))
+    print(round(time.time() - start))    # 约 1
+
+asyncio.run(main())</code></pre>
+
+<h3>面试追问与参考答案</h3>
+<ul>
+<li><strong>只能用同步 SDK 怎么办？</strong><code>to_thread</code> / <code>run_in_executor</code>，并控制线程池大小，防止下游被打爆；更好的是换成原生异步客户端（httpx、asyncpg 等）。</li>
+<li><strong>CPU 密集任务呢？</strong>进程池；或用释放 GIL 的 C 扩展（NumPy）；或拆成独立服务。</li>
+<li><strong>gather 中一个任务抛异常会怎样？</strong>默认第一个异常会传播给 await gather 的地方，其他任务<strong>不会被取消</strong>，继续运行；<code>return_exceptions=True</code> 则把异常当结果返回。需要“一个失败全部取消”的语义时用 3.11+ 的 <code>asyncio.TaskGroup</code>。</li>
+</ul>
+</section>
+
+<section id="q5">
+<h2>题五：死锁（转账）</h2>
+<h3>题目</h3>
+<pre><code class="language-java">void transfer(Account from, Account to, int amt) {
+    synchronized (from) {
+        synchronized (to) {
+            from.balance -= amt;
+            to.balance += amt;
+        }
+    }
+}
+// 线程1: transfer(A, B, 10)   线程2: transfer(B, A, 20)</code></pre>
+<p><strong>问</strong>：会发生什么？怎么修？</p>
+
+<h3>可能结果</h3>
+<p>多数时候正常完成；但存在一种交错会导致<strong>永久死锁</strong>：两个线程都挂住，CPU 占用为 0，进程不退出，jstack 能看到 “Found one Java-level deadlock”。</p>
+
+<h3>详细解析</h3>
+<pre class="mermaid">
+sequenceDiagram
+  participant T1 as 线程1 transfer(A,B)
+  participant A as 锁 A
+  participant B as 锁 B
+  participant T2 as 线程2 transfer(B,A)
+  T1->>A: 加锁成功
+  T2->>B: 加锁成功
+  T1->>B: 请求，等待 T2 释放
+  T2->>A: 请求，等待 T1 释放
+  Note over T1,T2: 互相等待，永远不会结束
+</pre>
+<p>synchronized 获取锁时没有超时、不可中断，一旦形成环形等待就永远等下去。</p>
+
+<h3>原理：Coffman 死锁四条件</h3>
+<p>死锁同时需要以下四个条件（Coffman 等，1971），破坏任意一个就能预防：</p>
+<table>
+<thead><tr><th>条件</th><th>含义</th><th>破坏方法</th></tr></thead>
+<tbody>
+<tr><td>互斥</td><td>资源同一时刻只能被一个线程持有</td><td>无锁结构、CAS、不可变数据（往往不可行）</td></tr>
+<tr><td>持有并等待</td><td>持有一个锁的同时去请求另一个</td><td>一次性申请全部资源；用一把粗粒度锁</td></tr>
+<tr><td>不可剥夺</td><td>已持有的锁不能被强行拿走</td><td><code>tryLock</code> 超时失败后主动释放已持有的锁</td></tr>
+<tr><td>循环等待</td><td>等待关系形成环</td><td><strong>全局统一的加锁顺序</strong></td></tr>
+</tbody>
+</table>
+
+<h3>修复</h3>
+<p><strong>方案 1：按 id 固定加锁顺序（破坏循环等待，最常用）</strong></p>
+<pre><code class="language-java">void transfer(Account from, Account to, int amt) {
+    if (from.id == to.id) throw new IllegalArgumentException("same account");
+    Account first  = from.id &lt; to.id ? from : to;
+    Account second = from.id &lt; to.id ? to : from;
+    synchronized (first) {
+        synchronized (second) {
+            if (from.balance &lt; amt) throw new IllegalStateException("余额不足");
+            from.balance -= amt;
+            to.balance += amt;
+        }
+    }
+}</code></pre>
+<p><strong>方案 2：tryLock + 超时 + 随机退避（破坏不可剥夺）</strong></p>
+<pre><code class="language-java">boolean transfer(Account from, Account to, int amt) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+    while (System.nanoTime() &lt; deadline) {
+        if (from.lock.tryLock(50, TimeUnit.MILLISECONDS)) {
+            try {
+                if (to.lock.tryLock(50, TimeUnit.MILLISECONDS)) {
+                    try {
+                        from.balance -= amt;
+                        to.balance += amt;
+                        return true;
+                    } finally { to.lock.unlock(); }
+                }
+            } finally { from.lock.unlock(); }
+        }
+        Thread.sleep(ThreadLocalRandom.current().nextInt(1, 20)); // 随机退避，避免活锁
+    }
+    return false;
+}</code></pre>
+<p>随机退避很重要：如果两边固定时间后同时重试，可能反复“同时拿一把、同时放弃”，形成<strong>活锁</strong>。</p>
+<p><strong>方案 3：一把全局锁</strong>，简单正确，但所有转账串行，吞吐量低。</p>
+<p><strong>方案 4：交给数据库</strong>，用单条条件更新，让数据库的行锁和事务保证原子性：</p>
+<pre><code class="language-sql">BEGIN;
+UPDATE accounts SET balance = balance - :amt
+ WHERE id = :from AND balance &gt;= :amt;    -- 影响行数为 0 则余额不足，回滚
+UPDATE accounts SET balance = balance + :amt WHERE id = :to;
+COMMIT;</code></pre>
+<p>数据库同样可能死锁（两个事务以相反顺序锁行），但数据库有死锁检测，会回滚其中一个事务并报错（如 MySQL 的 1213、PostgreSQL 的 40P01），应用侧需要重试；同样可以按 id 顺序更新来降低死锁概率。</p>
+
+<h3>面试追问与参考答案</h3>
+<ul>
+<li><strong>怎么排查线上死锁？</strong><code>jstack &lt;pid&gt;</code> 或 <code>jcmd &lt;pid&gt; Thread.print</code>，JVM 会直接打印检测到的死锁环；也可以用 <code>ThreadMXBean.findDeadlockedThreads()</code> 做监控。</li>
+<li><strong>分布式环境下怎么办？</strong>用分布式锁（Redis、ZooKeeper、etcd），但必须带<strong>租约（TTL）</strong>，防止持有者崩溃后永远不释放。租约又带来新问题：持有者 GC 停顿或网络卡顿超过 TTL，锁已经过期给了别人，它醒来后仍以为自己持有锁，会写坏数据。</li>
+<li><strong>Fencing token 是什么？</strong>锁服务每次授予锁时返回一个单调递增的令牌号，客户端写存储时带上它，存储拒绝比已见过的更小的令牌。这样过期持有者的迟到写入会被拒绝。见 Martin Kleppmann 的 <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">How to do distributed locking</a>；etcd 和 ZooKeeper 可以用 revision / zxid 作为天然的 fencing token。</li>
+</ul>
+</section>
+
+<section id="summary">
+<h2>总结</h2>
+<table>
+<thead><tr><th>题</th><th>根因</th><th>一句话原理</th><th>首选修法</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>读-改-写不原子</td><td>两次写之间的窗口导致覆盖</td><td>AtomicInteger / LongAdder</td></tr>
+<tr><td>2</td><td>数据竞争 + 重排序</td><td>Store Buffer 让写晚于后续读可见；JMM 只保证 happens-before</td><td>volatile 或锁，消除数据竞争</td></tr>
+<tr><td>3</td><td>Add 晚于 Wait；闭包共享变量</td><td>go 语句不等待执行；1.22 前循环变量共享</td><td>go 前 Add；传参；wg.Go</td></tr>
+<tr><td>4</td><td>阻塞调用冻结事件循环</td><td>协作式调度，只有 await 才让出</td><td>asyncio.sleep / to_thread</td></tr>
+<tr><td>5</td><td>循环等待</td><td>Coffman 四条件同时成立</td><td>固定加锁顺序；DB 条件更新</td></tr>
+</tbody>
+</table>
+<p><strong>参考资料</strong>：<a href="https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html">JLS Chapter 17: Threads and Locks</a>；<a href="https://go.dev/ref/mem">The Go Memory Model</a>；<a href="https://go.dev/doc/go1.22">Go 1.22 Release Notes</a>；<a href="https://go.dev/blog/loopvar-preview">Fixing For Loops in Go 1.22</a>；<a href="https://docs.python.org/3/library/asyncio-dev.html">Python: Developing with asyncio</a>；<a href="https://www.cl.cam.ac.uk/~pes20/weakmemory/cacm.pdf">x86-TSO</a>；<a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Kleppmann: How to do distributed locking</a>。</p>
+</section>
